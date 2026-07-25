@@ -109,6 +109,8 @@ RunSchema.index({ link: 1, label: 1, status: 1 });
 
 const OrderSchema = new mongoose.Schema({
   schedulerOrderId: { type: String, required: true, unique: true, index: true },
+  // Owner of this order. Indexed because every user-facing query filters on it.
+  userId:           { type: String, required: true, index: true, default: '' },
   name:             { type: String, required: true },
   link:             { type: String, required: true },
   status: {
@@ -127,6 +129,29 @@ const SettingsSchema = new mongoose.Schema({
   key:       { type: String, required: true, unique: true },
   value:     { type: mongoose.Schema.Types.Mixed, required: true },
   updatedAt: { type: Date, default: Date.now },
+});
+
+/* User accounts. Passwords are never stored in plain text — only a
+   scrypt hash plus a per-user random salt. */
+const UserSchema = new mongoose.Schema({
+  email:        { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
+  passwordHash: { type: String, required: true },
+  salt:         { type: String, required: true },
+  name:         { type: String, default: '' },
+  isActive:     { type: Boolean, default: true },
+  // Reserved so email verification can be switched on later without a migration.
+  isVerified:   { type: Boolean, default: false },
+  createdAt:    { type: Date, default: Date.now },
+  lastLoginAt:  { type: Date, default: null },
+});
+
+/* Opaque session tokens. Only the SHA-256 of the token is stored, so a
+   database leak does not hand out working sessions. */
+const SessionSchema = new mongoose.Schema({
+  tokenHash: { type: String, required: true, unique: true, index: true },
+  userId:    { type: String, required: true, index: true },
+  createdAt: { type: Date, default: Date.now },
+  expiresAt: { type: Date, required: true, index: true },
 });
 
 /* Admin-managed panel configuration.
@@ -151,6 +176,9 @@ const PanelConfigSchema = new mongoose.Schema({
 
 const PanelConfig = mongoose.model('PanelConfig', PanelConfigSchema);
 
+const User     = mongoose.model('User', UserSchema);
+const Session  = mongoose.model('Session', SessionSchema);
+
 const Run      = mongoose.model('Run', RunSchema);
 const Order    = mongoose.model('Order', OrderSchema);
 const Settings = mongoose.model('Settings', SettingsSchema);
@@ -159,6 +187,103 @@ const Settings = mongoose.model('Settings', SettingsSchema);
    SETTINGS (loaded from DB at boot)
    ============================================================ */
 let MIN_VIEWS_PER_RUN = 100;
+
+/* ============================================================
+   USER AUTH (email + password)
+   Uses Node's built-in crypto — no extra dependencies.
+   - Passwords: scrypt with a 16-byte random salt per user.
+   - Sessions:  256-bit random token; only its SHA-256 is stored.
+   ============================================================ */
+const crypto = require('crypto');
+
+const SESSION_TTL_DAYS = 30;
+const SESSION_TTL_MS = SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
+
+function hashPassword(password, salt) {
+  // 64-byte derived key; scrypt is deliberately slow to resist brute force.
+  return crypto.scryptSync(String(password), salt, 64).toString('hex');
+}
+
+function makeSalt() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function verifyPassword(password, salt, expectedHash) {
+  const actual = Buffer.from(hashPassword(password, salt), 'hex');
+  const expected = Buffer.from(String(expectedHash), 'hex');
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(actual, expected);
+}
+
+function makeSessionToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function publicUser(user) {
+  return {
+    id: String(user._id),
+    email: user.email,
+    name: user.name || '',
+    createdAt: user.createdAt,
+  };
+}
+
+async function createSession(userId) {
+  const token = makeSessionToken();
+  await Session.create({
+    tokenHash: hashToken(token),
+    userId: String(userId),
+    expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+  });
+  return token;
+}
+
+/** Pull the bearer token off the request, if present. */
+function bearerToken(req) {
+  const header = String(req.headers.authorization || '');
+  return header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+}
+
+/** Resolve the session -> user, or null. Also prunes expired sessions. */
+async function resolveUser(req) {
+  const token = bearerToken(req);
+  if (!token) return null;
+
+  const session = await Session.findOne({ tokenHash: hashToken(token) }).lean();
+  if (!session) return null;
+
+  if (new Date(session.expiresAt).getTime() < Date.now()) {
+    await Session.deleteOne({ tokenHash: session.tokenHash }).catch(() => {});
+    return null;
+  }
+
+  const user = await User.findById(session.userId);
+  if (!user || !user.isActive) return null;
+  return user;
+}
+
+/** Route guard: 401 unless a valid session is supplied. */
+async function requireUser(req, res, next) {
+  try {
+    const user = await resolveUser(req);
+    if (!user) return res.status(401).json({ error: 'Not signed in' });
+    req.user = user;
+    next();
+  } catch (e) {
+    err('requireUser:', e?.message || e);
+    res.status(500).json({ error: 'Auth check failed' });
+  }
+}
 
 /* ============================================================
    ADMIN AUTH
@@ -179,7 +304,7 @@ function requireAdmin(req, res, next) {
   // Length-independent comparison; avoids leaking length via early exit.
   const a = Buffer.from(supplied);
   const b = Buffer.from(ADMIN_PASSWORD);
-  const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
   if (!ok) return res.status(401).json({ error: 'Invalid admin password' });
   next();
 }
@@ -646,6 +771,10 @@ async function start() {
 
   await loadSettings();
 
+  // Drop expired sessions so the collection doesn't grow without bound.
+  const purged = await Session.deleteMany({ expiresAt: { $lt: new Date() } });
+  if (purged.deletedCount > 0) log(`🧹 Purged ${purged.deletedCount} expired session(s)`);
+
   // On boot, clear any leftover processing markers; they'll be re-claimed.
   // We don't know if those runs actually completed at the provider, but the
   // safer choice is to reset them — providers usually deduplicate identical
@@ -690,7 +819,7 @@ process.on('SIGTERM', async () => {
    ============================================================ */
 
 // ---- Create order ----
-app.post('/api/order', async (req, res) => {
+app.post('/api/order', requireUser, async (req, res) => {
   try {
     const { link, services, name } = req.body || {};
     if (!link || !services) {
@@ -732,6 +861,7 @@ app.post('/api/order', async (req, res) => {
 
     const orderDoc = await Order.create({
       schedulerOrderId,
+      userId: String(req.user._id),
       name: name || `Order ${schedulerOrderId}`,
       link,
       status: runs.length === 0 ? 'cancelled' : 'pending',
@@ -832,84 +962,11 @@ async function getInrExchangeRate(currency) {
   }
 }
 
-app.post('/api/panel/pricing-meta', async (req, res) => {
-  const { apiUrl, apiKey } = req.body || {};
-  const requestedCurrency = normalizeCurrency(req.body?.currency);
-  const safeApiUrl = validateProviderUrl(apiUrl);
-  if (!safeApiUrl || !apiKey) return res.status(400).json({ error: 'Valid API URL and key are required' });
-
-  try {
-    let currency = requestedCurrency;
-    let currencySource = requestedCurrency ? 'user' : null;
-    let balance = null;
-
-    // Even when a user supplied a currency, fetch balance for useful validation.
-    try {
-      const params = new URLSearchParams({ key: String(apiKey), action: 'balance' });
-      const panelResponse = await axios.post(safeApiUrl, params.toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: PROVIDER_HTTP_TIMEOUT_MS,
-        validateStatus: () => true,
-      });
-      const body = panelResponse.data;
-      const detected = extractPanelCurrency(body);
-      const parsedBalance = Number(body?.balance ?? body?.data?.balance);
-      if (Number.isFinite(parsedBalance)) balance = parsedBalance;
-      if (!currency && detected) {
-        currency = detected;
-        currencySource = 'panel';
-      }
-    } catch (e) {
-      warn('Panel balance/currency detection failed:', e?.message || e);
-    }
-
-    if (!currency) {
-      return res.json({
-        currency: null,
-        currencySource: null,
-        exchangeRateToInr: null,
-        exchangeRateUpdatedAt: null,
-        balance,
-        requiresCurrencyConfirmation: true,
-      });
-    }
-
-    const exchange = await getInrExchangeRate(currency);
-    return res.json({
-      currency,
-      currencySource,
-      exchangeRateToInr: exchange.rate,
-      exchangeRateUpdatedAt: exchange.updatedAt,
-      balance,
-      requiresCurrencyConfirmation: false,
-    });
-  } catch (e) {
-    return res.status(502).json({ error: e?.message || 'Pricing metadata is unavailable' });
-  }
-});
-
-// ---- Fetch services from provider ----
-app.post('/api/services', async (req, res) => {
-  const { apiUrl, apiKey } = req.body || {};
-  if (!apiUrl || !apiKey) return res.status(400).json({ error: 'Missing API URL or key' });
-  try {
-    const params = new URLSearchParams({ key: apiKey, action: 'services' });
-    const response = await axios.post(apiUrl, params.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: PROVIDER_HTTP_TIMEOUT_MS,
-      validateStatus: () => true,
-    });
-    return res.status(response.status).json(response.data);
-  } catch (e) {
-    return res.status(500).json({ error: e?.response?.data || e?.message || 'Provider error' });
-  }
-});
-
 // ---- Single order status ----
-app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
+app.get('/api/order/status/:schedulerOrderId', requireUser, async (req, res) => {
   try {
     const { schedulerOrderId } = req.params;
-    const order = await Order.findOne({ schedulerOrderId }).lean();
+    const order = await Order.findOne({ schedulerOrderId, userId: String(req.user._id) }).lean();
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const runs = await Run.find({ schedulerOrderId }).lean();
@@ -941,9 +998,9 @@ app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
 });
 
 // ---- All orders status ----
-app.get('/api/orders/status', async (_req, res) => {
+app.get('/api/orders/status', requireUser, async (req, res) => {
   try {
-    const orders = await Order.find().sort({ createdAt: -1 }).lean();
+    const orders = await Order.find({ userId: String(req.user._id) }).sort({ createdAt: -1 }).lean();
     const result = await Promise.all(orders.map(async (o) => {
       const runs = await Run.find(
         { schedulerOrderId: o.schedulerOrderId },
@@ -958,14 +1015,15 @@ app.get('/api/orders/status', async (_req, res) => {
 });
 
 // ---- Pause / resume / cancel ----
-app.post('/api/order/control', async (req, res) => {
+app.post('/api/order/control', requireUser, async (req, res) => {
   try {
     const { schedulerOrderId, action } = req.body || {};
     if (!schedulerOrderId || !action) {
       return res.status(400).json({ error: 'Missing schedulerOrderId or action' });
     }
 
-    const order = await Order.findOne({ schedulerOrderId });
+    // Scoped by userId so one account cannot pause/cancel another's order.
+    const order = await Order.findOne({ schedulerOrderId, userId: String(req.user._id) });
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     if (action === 'cancel') {
@@ -1010,8 +1068,14 @@ app.post('/api/order/control', async (req, res) => {
 });
 
 // ---- Order runs only ----
-app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
+app.get('/api/order/runs/:schedulerOrderId', requireUser, async (req, res) => {
   try {
+    const owned = await Order.findOne(
+      { schedulerOrderId: req.params.schedulerOrderId, userId: String(req.user._id) },
+      { _id: 1 }
+    ).lean();
+    if (!owned) return res.status(404).json({ error: 'Order not found' });
+
     const runs = await Run.find({ schedulerOrderId: req.params.schedulerOrderId }).lean();
     return res.json({
       schedulerOrderId: req.params.schedulerOrderId,
@@ -1095,6 +1159,126 @@ app.post('/api/scheduler/trigger', async (_req, res) => {
 });
 
 /* ============================================================
+   AUTH ROUTES
+   ============================================================ */
+
+// ---- Sign up ----
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    const name = String(req.body?.name || '').trim();
+
+    if (!EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const existing = await User.findOne({ email }).lean();
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+
+    const salt = makeSalt();
+    const user = await User.create({
+      email,
+      salt,
+      passwordHash: hashPassword(password, salt),
+      name,
+      lastLoginAt: new Date(),
+    });
+
+    const token = await createSession(user._id);
+    log(`👤 New account: ${email}`);
+    return res.status(201).json({ success: true, token, user: publicUser(user) });
+  } catch (e) {
+    // Unique index can still fire under a race; report it cleanly.
+    if (e?.code === 11000) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+    err('POST /api/auth/signup:', e?.message || e);
+    return res.status(500).json({ error: 'Could not create account' });
+  }
+});
+
+// ---- Log in ----
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = await User.findOne({ email });
+    // Same message whether the email is unknown or the password is wrong,
+    // so the endpoint can't be used to enumerate registered accounts.
+    const INVALID = 'Incorrect email or password';
+    if (!user) return res.status(401).json({ error: INVALID });
+    if (!verifyPassword(password, user.salt, user.passwordHash)) {
+      return res.status(401).json({ error: INVALID });
+    }
+    if (!user.isActive) {
+      return res.status(403).json({ error: 'This account has been disabled' });
+    }
+
+    user.lastLoginAt = new Date();
+    await user.save();
+
+    const token = await createSession(user._id);
+    return res.json({ success: true, token, user: publicUser(user) });
+  } catch (e) {
+    err('POST /api/auth/login:', e?.message || e);
+    return res.status(500).json({ error: 'Could not sign in' });
+  }
+});
+
+// ---- Who am I (used to restore a session on page load) ----
+app.get('/api/auth/me', requireUser, (req, res) => {
+  res.json({ user: publicUser(req.user) });
+});
+
+// ---- Log out (invalidate this session only) ----
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const token = bearerToken(req);
+    if (token) await Session.deleteOne({ tokenHash: hashToken(token) });
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ success: true });
+  }
+});
+
+// ---- Change password (invalidates all other sessions) ----
+app.post('/api/auth/change-password', requireUser, async (req, res) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword || '');
+    const newPassword = String(req.body?.newPassword || '');
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    if (!verifyPassword(currentPassword, req.user.salt, req.user.passwordHash)) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    const salt = makeSalt();
+    req.user.salt = salt;
+    req.user.passwordHash = hashPassword(newPassword, salt);
+    await req.user.save();
+
+    // Drop every session, then issue a fresh one for this device.
+    await Session.deleteMany({ userId: String(req.user._id) });
+    const token = await createSession(req.user._id);
+    res.json({ success: true, token });
+  } catch (e) {
+    err('POST /api/auth/change-password:', e?.message || e);
+    res.status(500).json({ error: 'Could not change password' });
+  }
+});
+
+/* ============================================================
    PANEL CONFIG ROUTES
    ============================================================ */
 
@@ -1161,6 +1345,49 @@ app.post('/api/admin/panel-config', requireAdmin, async (req, res) => {
   } catch (e) {
     err('POST /api/admin/panel-config:', e?.message || e);
     res.status(500).json({ error: e?.message || 'Could not save panel configuration' });
+  }
+});
+
+// ---- Admin: list registered users ----
+app.get('/api/admin/users', requireAdmin, async (_req, res) => {
+  try {
+    const users = await User.find().sort({ createdAt: -1 }).limit(500).lean();
+    const counts = await Order.aggregate([
+      { $group: { _id: '$userId', total: { $sum: 1 } } },
+    ]);
+    const byUser = new Map(counts.map(c => [String(c._id), c.total]));
+    res.json({
+      total: users.length,
+      users: users.map(u => ({
+        id: String(u._id),
+        email: u.email,
+        name: u.name || '',
+        isActive: u.isActive !== false,
+        createdAt: u.createdAt,
+        lastLoginAt: u.lastLoginAt,
+        orderCount: byUser.get(String(u._id)) || 0,
+      })),
+    });
+  } catch (e) {
+    err('GET /api/admin/users:', e?.message || e);
+    res.status(500).json({ error: 'Could not load users' });
+  }
+});
+
+// ---- Admin: enable / disable an account ----
+app.post('/api/admin/users/:id/active', requireAdmin, async (req, res) => {
+  try {
+    const isActive = Boolean(req.body?.isActive);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.isActive = isActive;
+    await user.save();
+    // Disabling an account must also kill its live sessions.
+    if (!isActive) await Session.deleteMany({ userId: String(user._id) });
+    res.json({ success: true, id: String(user._id), isActive });
+  } catch (e) {
+    err('POST /api/admin/users/:id/active:', e?.message || e);
+    res.status(500).json({ error: 'Could not update user' });
   }
 });
 
