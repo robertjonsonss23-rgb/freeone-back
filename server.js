@@ -120,6 +120,9 @@ const OrderSchema = new mongoose.Schema({
   },
   totalRuns:        { type: Number, required: true },
   completedRuns:    { type: Number, default: 0 },
+  // What the user paid, in paise. Used for pro-rata refunds on cancel.
+  chargedPaise:     { type: Number, default: 0 },
+  refundedPaise:    { type: Number, default: 0 },
   runStatuses:      [{ type: String }],
   createdAt:        { type: Date, default: Date.now },
   lastUpdatedAt:    { type: Date, default: Date.now },
@@ -141,8 +144,75 @@ const UserSchema = new mongoose.Schema({
   isActive:     { type: Boolean, default: true },
   // Reserved so email verification can be switched on later without a migration.
   isVerified:   { type: Boolean, default: false },
+  /* Wallet balance in paise (integer) — never floats, so repeated
+     debits can't drift. ₹50.00 is stored as 5000. */
+  balancePaise: { type: Number, default: 0, min: 0 },
   createdAt:    { type: Date, default: Date.now },
   lastLoginAt:  { type: Date, default: null },
+});
+
+/* Immutable ledger. Every credit/debit writes one row, so a balance can
+   always be explained and audited. */
+const TransactionSchema = new mongoose.Schema({
+  userId:       { type: String, required: true, index: true },
+  type: {
+    type: String,
+    enum: ['deposit', 'order_debit', 'refund', 'admin_credit', 'admin_debit'],
+    required: true,
+  },
+  amountPaise:  { type: Number, required: true },   // positive = credit
+  balanceAfter: { type: Number, required: true },
+  note:         { type: String, default: '' },
+  reference:    { type: String, default: '' },       // schedulerOrderId / depositId
+  createdAt:    { type: Date, default: Date.now, index: true },
+});
+
+/* A user-submitted top-up awaiting admin approval. */
+const DepositSchema = new mongoose.Schema({
+  userId:      { type: String, required: true, index: true },
+  userEmail:   { type: String, default: '' },
+  amountPaise: { type: Number, required: true },
+  method:      { type: String, enum: ['upi', 'crypto'], required: true },
+  methodId:    { type: String, default: '' },        // which UPI id / wallet was used
+  reference:   { type: String, required: true },      // UTR or tx hash
+  status: {
+    type: String,
+    enum: ['pending', 'approved', 'rejected'],
+    default: 'pending',
+    index: true,
+  },
+  adminNote:   { type: String, default: '' },
+  createdAt:   { type: Date, default: Date.now, index: true },
+  reviewedAt:  { type: Date, default: null },
+});
+DepositSchema.index({ status: 1, createdAt: -1 });
+
+/* Admin-controlled payment settings. */
+const PaymentSettingsSchema = new mongoose.Schema({
+  key:              { type: String, required: true, unique: true, default: 'default' },
+  minDepositPaise:  { type: Number, default: 5000 },   // ₹50
+  markupPercent:    { type: Number, default: 30 },
+  upiEnabled:       { type: Boolean, default: true },
+  cryptoEnabled:    { type: Boolean, default: false },
+  upiMethods: [{
+    _id:         false,
+    id:          { type: String, required: true },
+    label:       { type: String, default: '' },
+    upiId:       { type: String, default: '' },
+    payeeName:   { type: String, default: '' },
+    instructions:{ type: String, default: '' },
+    isActive:    { type: Boolean, default: true },
+  }],
+  cryptoMethods: [{
+    _id:         false,
+    id:          { type: String, required: true },
+    label:       { type: String, default: '' },
+    network:     { type: String, default: '' },
+    address:     { type: String, default: '' },
+    instructions:{ type: String, default: '' },
+    isActive:    { type: Boolean, default: true },
+  }],
+  updatedAt:        { type: Date, default: Date.now },
 });
 
 /* Opaque session tokens. Only the SHA-256 of the token is stored, so a
@@ -205,6 +275,10 @@ const PanelConfigSchema = new mongoose.Schema({
 const PanelConfig = mongoose.model('PanelConfig', PanelConfigSchema);
 const Panel       = mongoose.model('Panel', PanelSchema);
 
+const Transaction     = mongoose.model('Transaction', TransactionSchema);
+const Deposit         = mongoose.model('Deposit', DepositSchema);
+const PaymentSettings = mongoose.model('PaymentSettings', PaymentSettingsSchema);
+
 const User     = mongoose.model('User', UserSchema);
 const Session  = mongoose.model('Session', SessionSchema);
 
@@ -263,6 +337,7 @@ function publicUser(user) {
     id: String(user._id),
     email: user.email,
     name: user.name || '',
+    balance: Math.round(Number(user.balancePaise) || 0) / 100,
     createdAt: user.createdAt,
   };
 }
@@ -339,6 +414,98 @@ function requireAdmin(req, res, next) {
 }
 
 const SERVICE_LABELS = ['views', 'likes', 'shares', 'saves', 'comments', 'reposts'];
+
+/* ============================================================
+   WALLET
+   All amounts are integer paise. Balance changes go through
+   findOneAndUpdate with a guard condition so two concurrent
+   requests can never both spend the same money.
+   ============================================================ */
+
+function toPaise(rupees) {
+  return Math.round(Number(rupees || 0) * 100);
+}
+function toRupees(paise) {
+  return Math.round(Number(paise || 0)) / 100;
+}
+
+async function getPaymentSettings() {
+  let doc = await PaymentSettings.findOne({ key: 'default' });
+  if (!doc) doc = await PaymentSettings.create({ key: 'default' });
+  return doc;
+}
+
+/** Credit a wallet and write a ledger row. Returns the new balance. */
+async function creditWallet(userId, amountPaise, { type, note = '', reference = '' }) {
+  const amount = Math.round(Number(amountPaise));
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('Credit amount must be positive');
+
+  const user = await User.findByIdAndUpdate(
+    userId,
+    { $inc: { balancePaise: amount } },
+    { new: true }
+  );
+  if (!user) throw new Error('User not found');
+
+  await Transaction.create({
+    userId: String(userId),
+    type,
+    amountPaise: amount,
+    balanceAfter: user.balancePaise,
+    note,
+    reference,
+  });
+  return user.balancePaise;
+}
+
+/**
+ * Debit a wallet only if the funds are there. The `$gte` guard makes the
+ * check-and-deduct a single atomic operation, so parallel orders cannot
+ * push the balance negative.
+ * Returns { ok, balance } — ok:false means insufficient funds.
+ */
+async function debitWallet(userId, amountPaise, { type, note = '', reference = '' }) {
+  const amount = Math.round(Number(amountPaise));
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('Debit amount must be positive');
+
+  const user = await User.findOneAndUpdate(
+    { _id: userId, balancePaise: { $gte: amount } },
+    { $inc: { balancePaise: -amount } },
+    { new: true }
+  );
+  if (!user) return { ok: false, balance: null };
+
+  await Transaction.create({
+    userId: String(userId),
+    type,
+    amountPaise: -amount,
+    balanceAfter: user.balancePaise,
+    note,
+    reference,
+  });
+  return { ok: true, balance: user.balancePaise };
+}
+
+/** Public view of the payment options a user can pay with. */
+function publicPaymentSettings(doc) {
+  return {
+    minDeposit: toRupees(doc.minDepositPaise),
+    upiEnabled: Boolean(doc.upiEnabled),
+    cryptoEnabled: Boolean(doc.cryptoEnabled),
+    upiMethods: (doc.upiMethods || [])
+      .filter(m => m.isActive)
+      .map(m => ({
+        id: m.id, label: m.label, upiId: m.upiId,
+        payeeName: m.payeeName, instructions: m.instructions,
+      })),
+    cryptoMethods: (doc.cryptoMethods || [])
+      .filter(m => m.isActive)
+      .map(m => ({
+        id: m.id, label: m.label, network: m.network,
+        address: m.address, instructions: m.instructions,
+      })),
+  };
+}
 
 /** Read the singleton panel config, creating an empty one on first call. */
 async function getPanelConfig() {
@@ -991,15 +1158,74 @@ app.post('/api/order', requireUser, async (req, res) => {
       });
     }
 
+    /* ---- Price the order and charge the wallet BEFORE scheduling ---- */
+    // Total the units the client asked for, per label. Quantities are
+    // re-derived here rather than trusted from any client-sent price.
+    const unitTotals = {};
+    for (const [label, value] of Object.entries(resolved)) {
+      unitTotals[label] = (value.runs || []).reduce((sum, run) => {
+        if (label === 'comments') {
+          const lines = String(run.comments || '').split('\n').filter(l => l.trim());
+          return sum + Math.min(lines.length, 10);
+        }
+        return sum + Math.max(0, Math.floor(Number(run.quantity) || 0));
+      }, 0);
+    }
+
+    const quote = await computeQuote(unitTotals);
+    if (!quote.available) {
+      return res.status(503).json({ error: quote.reason || 'Could not price this order.' });
+    }
+
     const schedulerOrderId = makeOrderId();
-    const runs = await addRuns(resolved, { link }, schedulerOrderId);
+
+    // Atomic: fails cleanly if the balance is short, and cannot be raced.
+    const debit = await debitWallet(req.user._id, quote.totalPaise, {
+      type: 'order_debit',
+      note: `Order for ${link}`,
+      reference: schedulerOrderId,
+    });
+
+    if (!debit.ok) {
+      return res.status(402).json({
+        error: 'Insufficient wallet balance',
+        required: toRupees(quote.totalPaise),
+        balance: toRupees(req.user.balancePaise),
+        shortfall: toRupees(quote.totalPaise - req.user.balancePaise),
+      });
+    }
+
+    let runs;
+    try {
+      runs = await addRuns(resolved, { link }, schedulerOrderId);
+    } catch (e) {
+      // Scheduling blew up after taking the money — hand it straight back.
+      await creditWallet(req.user._id, quote.totalPaise, {
+        type: 'refund',
+        note: 'Automatic refund: order could not be scheduled',
+        reference: schedulerOrderId,
+      });
+      throw e;
+    }
+
+    if (runs.length === 0) {
+      await creditWallet(req.user._id, quote.totalPaise, {
+        type: 'refund',
+        note: 'Automatic refund: no runs were scheduled',
+        reference: schedulerOrderId,
+      });
+      return res.status(400).json({
+        error: 'No runs could be scheduled (check quantities and times).',
+      });
+    }
 
     const orderDoc = await Order.create({
       schedulerOrderId,
       userId: String(req.user._id),
       name: name || `Order ${schedulerOrderId}`,
       link,
-      status: runs.length === 0 ? 'cancelled' : 'pending',
+      chargedPaise: quote.totalPaise,
+      status: 'pending',
       totalRuns: runs.length,
       completedRuns: 0,
       runStatuses: runs.map(() => 'pending'),
@@ -1007,7 +1233,7 @@ app.post('/api/order', requireUser, async (req, res) => {
       lastUpdatedAt: new Date(),
     });
 
-    log(`📦 Order created ${schedulerOrderId} with ${runs.length} run(s)`);
+    log(`📦 Order ${schedulerOrderId}: ${runs.length} run(s), charged ₹${toRupees(quote.totalPaise)}`);
     return res.json({
       success: true,
       message: 'Order scheduled',
@@ -1015,6 +1241,8 @@ app.post('/api/order', requireUser, async (req, res) => {
       status: orderDoc.status,
       completedRuns: 0,
       totalRuns: runs.length,
+      charged: toRupees(quote.totalPaise),
+      balance: toRupees(debit.balance),
     });
   } catch (e) {
     err('POST /api/order:', e?.message || e);
@@ -1162,11 +1390,31 @@ app.post('/api/order/control', requireUser, async (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     if (action === 'cancel') {
-      await Run.updateMany(
+      // Count what never ran, so we refund only the unused portion.
+      const totalRuns = await Run.countDocuments({ schedulerOrderId });
+      const cancelled = await Run.updateMany(
         { schedulerOrderId, status: { $in: ['pending', 'processing', 'paused'] } },
         { $set: { status: 'cancelled', error: 'Cancelled by user' } }
       );
       order.status = 'cancelled';
+
+      const notRun = cancelled.modifiedCount || 0;
+      const charged = Number(order.chargedPaise) || 0;
+      const alreadyRefunded = Number(order.refundedPaise) || 0;
+
+      if (charged > 0 && notRun > 0 && totalRuns > 0 && alreadyRefunded === 0) {
+        const refund = Math.floor((charged * notRun) / totalRuns);
+        if (refund > 0) {
+          await creditWallet(order.userId, refund, {
+            type: 'refund',
+            note: `Refund for ${notRun} of ${totalRuns} unexecuted run(s)`,
+            reference: schedulerOrderId,
+          });
+          order.refundedPaise = refund;
+          log(`💸 Refunded ₹${toRupees(refund)} on cancel of ${schedulerOrderId}`);
+        }
+      }
+
       await order.save();
       await recomputeOrderStatus(schedulerOrderId);
     } else if (action === 'pause') {
@@ -1422,130 +1670,458 @@ app.post('/api/auth/change-password', requireUser, async (req, res) => {
    The panel's per-service rates can only be read with the admin API key, so
    the calculation happens here and only the final numbers go to the browser.
    Body: { services: { views: 12000, likes: 300, ... } }  (total units each) */
+/* Compute the price of a set of service volumes.
+   Returns paise, including the admin's markup. Shared by /api/quote and
+   /api/order so a user is always charged exactly what they were shown. */
+async function computeQuote(requestedUnits) {
+  const cfg = await getPanelConfig();
+  const panelsById = await loadPanelsById();
+  const settings = await getPaymentSettings();
+  const markup = 1 + (Number(settings.markupPercent) || 0) / 100;
+
+  const catalogueCache = new Map();
+  const currencyCache = new Map();
+
+  async function loadPanel(panelId) {
+    if (catalogueCache.has(panelId)) return;
+    const panel = panelsById.get(panelId);
+    if (!panel) { catalogueCache.set(panelId, new Map()); return; }
+
+    const rates = new Map();
+    try {
+      const params = new URLSearchParams({ key: panel.apiKey, action: 'services' });
+      const response = await axios.post(panel.apiUrl, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: PROVIDER_HTTP_TIMEOUT_MS,
+        validateStatus: () => true,
+      });
+      const data = response.data;
+      const list = Array.isArray(data) ? data
+        : Array.isArray(data?.services) ? data.services
+        : Array.isArray(data?.data) ? data.data
+        : [];
+      for (const row of list) {
+        const id = String(row?.service ?? row?.id ?? '').trim();
+        const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
+          .replace(/[^\d.]/g, ''));
+        if (id && Number.isFinite(rate)) rates.set(id, rate);
+      }
+    } catch (e) {
+      warn(`Quote: catalogue fetch failed for ${panel.name}:`, e?.message || e);
+    }
+    catalogueCache.set(panelId, rates);
+
+    try {
+      const balanceParams = new URLSearchParams({ key: panel.apiKey, action: 'balance' });
+      const balanceRes = await axios.post(panel.apiUrl, balanceParams.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: PROVIDER_HTTP_TIMEOUT_MS,
+        validateStatus: () => true,
+      });
+      currencyCache.set(panelId, extractPanelCurrency(balanceRes.data) || 'INR');
+    } catch {
+      currencyCache.set(panelId, 'INR');
+    }
+  }
+
+  const fxCache = new Map();
+  async function toInr(amount, currency) {
+    if (!currency || currency === 'INR') return amount;
+    if (!fxCache.has(currency)) {
+      try {
+        const fx = await getInrExchangeRate(currency);
+        fxCache.set(currency, fx.rate);
+      } catch { fxCache.set(currency, null); }
+    }
+    const rate = fxCache.get(currency);
+    return rate == null ? null : amount * rate;
+  }
+
+  const breakdown = {};
+  let costInr = 0;
+  let missingRate = false;
+
+  for (const label of SERVICE_LABELS) {
+    const units = Math.max(0, Math.floor(Number(requestedUnits?.[label]) || 0));
+    if (units <= 0) continue;
+
+    const slots = usableSlots(cfg, label, panelsById);
+    if (slots.length === 0) continue;
+
+    const unitsPerSlot = units / slots.length;
+    let labelTotal = 0;
+    let pricedAny = false;
+
+    for (const slot of slots) {
+      await loadPanel(slot.panelId);
+      const rate = catalogueCache.get(slot.panelId)?.get(slot.serviceId);
+      if (!Number.isFinite(rate) || rate <= 0) { missingRate = true; continue; }
+
+      const native = (unitsPerSlot / 1000) * rate;
+      const inr = await toInr(native, currencyCache.get(slot.panelId));
+      if (inr == null) { missingRate = true; continue; }
+      labelTotal += inr;
+      pricedAny = true;
+    }
+
+    if (pricedAny) {
+      const withMarkup = labelTotal * markup;
+      breakdown[label] = Math.round(withMarkup * 100);   // paise
+      costInr += labelTotal;
+    }
+  }
+
+  if (Object.keys(breakdown).length === 0) {
+    return {
+      available: false,
+      reason: missingRate
+        ? 'Panel did not return usable rates.'
+        : 'No priced services in this order.',
+    };
+  }
+
+  const totalPaise = Object.values(breakdown).reduce((sum, v) => sum + v, 0);
+  return {
+    available: true,
+    totalPaise,
+    breakdownPaise: breakdown,
+    markupPercent: Number(settings.markupPercent) || 0,
+    partial: missingRate,
+  };
+}
+
 app.post('/api/quote', requireUser, async (req, res) => {
   try {
-    const cfg = await getPanelConfig();
-    const panelsById = await loadPanelsById();
-
     const requested = req.body?.services && typeof req.body.services === 'object'
       ? req.body.services
       : {};
+    const quote = await computeQuote(requested);
 
-    // Fetch each involved panel's catalogue once, then reuse it.
-    const catalogueCache = new Map();   // panelId -> Map(serviceId -> rate)
-    const currencyCache = new Map();    // panelId -> currency code
-
-    async function loadPanel(panelId) {
-      if (catalogueCache.has(panelId)) return;
-      const panel = panelsById.get(panelId);
-      if (!panel) { catalogueCache.set(panelId, new Map()); return; }
-
-      const rates = new Map();
-      try {
-        const params = new URLSearchParams({ key: panel.apiKey, action: 'services' });
-        const response = await axios.post(panel.apiUrl, params.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          timeout: PROVIDER_HTTP_TIMEOUT_MS,
-          validateStatus: () => true,
-        });
-        const data = response.data;
-        const list = Array.isArray(data) ? data
-          : Array.isArray(data?.services) ? data.services
-          : Array.isArray(data?.data) ? data.data
-          : [];
-        for (const row of list) {
-          const id = String(row?.service ?? row?.id ?? '').trim();
-          const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
-            .replace(/[^\d.]/g, ''));
-          if (id && Number.isFinite(rate)) rates.set(id, rate);
-        }
-      } catch (e) {
-        warn(`Quote: catalogue fetch failed for panel ${panel.name}:`, e?.message || e);
-      }
-      catalogueCache.set(panelId, rates);
-
-      // Currency, for INR conversion.
-      try {
-        const balanceParams = new URLSearchParams({ key: panel.apiKey, action: 'balance' });
-        const balanceRes = await axios.post(panel.apiUrl, balanceParams.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          timeout: PROVIDER_HTTP_TIMEOUT_MS,
-          validateStatus: () => true,
-        });
-        currencyCache.set(panelId, extractPanelCurrency(balanceRes.data) || 'INR');
-      } catch {
-        currencyCache.set(panelId, 'INR');
-      }
-    }
-
-    const fxCache = new Map();
-    async function toInr(amount, currency) {
-      if (!currency || currency === 'INR') return amount;
-      if (!fxCache.has(currency)) {
-        try {
-          const fx = await getInrExchangeRate(currency);
-          fxCache.set(currency, fx.rate);
-        } catch {
-          fxCache.set(currency, null);
-        }
-      }
-      const rate = fxCache.get(currency);
-      return rate == null ? null : amount * rate;
+    if (!quote.available) {
+      return res.json({ available: false, reason: quote.reason });
     }
 
     const breakdown = {};
-    let total = 0;
-    let missingRate = false;
-
-    for (const label of SERVICE_LABELS) {
-      const units = Math.max(0, Math.floor(Number(requested[label]) || 0));
-      if (units <= 0) continue;
-
-      const slots = usableSlots(cfg, label, panelsById);
-      if (slots.length === 0) continue;
-
-      // Runs rotate evenly across slots, so split the volume evenly too.
-      const unitsPerSlot = units / slots.length;
-      let labelTotal = 0;
-      let pricedAny = false;
-
-      for (const slot of slots) {
-        await loadPanel(slot.panelId);
-        const rate = catalogueCache.get(slot.panelId)?.get(slot.serviceId);
-        if (!Number.isFinite(rate) || rate <= 0) { missingRate = true; continue; }
-
-        const native = (unitsPerSlot / 1000) * rate;
-        const inr = await toInr(native, currencyCache.get(slot.panelId));
-        if (inr == null) { missingRate = true; continue; }
-        labelTotal += inr;
-        pricedAny = true;
-      }
-
-      if (pricedAny) {
-        breakdown[label] = Math.round(labelTotal * 100) / 100;
-        total += labelTotal;
-      }
-    }
-
-    if (Object.keys(breakdown).length === 0) {
-      return res.json({
-        available: false,
-        reason: missingRate
-          ? 'Panel did not return usable rates.'
-          : 'No priced services in this order.',
-      });
+    for (const [label, paise] of Object.entries(quote.breakdownPaise)) {
+      breakdown[label] = toRupees(paise);
     }
 
     return res.json({
       available: true,
-      total: Math.round(total * 100) / 100,
+      total: toRupees(quote.totalPaise),
       breakdown,
       currency: 'INR',
-      partial: missingRate,
+      partial: quote.partial,
+      balance: toRupees(req.user.balancePaise),
+      sufficient: req.user.balancePaise >= quote.totalPaise,
     });
   } catch (e) {
     err('POST /api/quote:', e?.message || e);
     return res.status(500).json({ error: e?.message || 'Could not calculate price' });
+  }
+});
+
+/* ============================================================
+   WALLET & DEPOSIT ROUTES
+   ============================================================ */
+
+// ---- Public: which payment methods are available ----
+app.get('/api/payment-methods', async (_req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    res.json(publicPaymentSettings(settings));
+  } catch (e) {
+    err('GET /api/payment-methods:', e?.message || e);
+    res.status(500).json({ error: 'Could not load payment methods' });
+  }
+});
+
+// ---- Wallet balance + recent ledger ----
+app.get('/api/wallet', requireUser, async (req, res) => {
+  try {
+    const transactions = await Transaction.find({ userId: String(req.user._id) })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    const deposits = await Deposit.find({ userId: String(req.user._id) })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    res.json({
+      balance: toRupees(req.user.balancePaise),
+      transactions: transactions.map(t => ({
+        id: String(t._id),
+        type: t.type,
+        amount: toRupees(t.amountPaise),
+        balanceAfter: toRupees(t.balanceAfter),
+        note: t.note,
+        reference: t.reference,
+        createdAt: t.createdAt,
+      })),
+      deposits: deposits.map(d => ({
+        id: String(d._id),
+        amount: toRupees(d.amountPaise),
+        method: d.method,
+        reference: d.reference,
+        status: d.status,
+        adminNote: d.adminNote,
+        createdAt: d.createdAt,
+        reviewedAt: d.reviewedAt,
+      })),
+    });
+  } catch (e) {
+    err('GET /api/wallet:', e?.message || e);
+    res.status(500).json({ error: 'Could not load wallet' });
+  }
+});
+
+// ---- Submit a top-up for approval ----
+app.post('/api/wallet/deposit', requireUser, async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    const amountPaise = toPaise(req.body?.amount);
+    const method = String(req.body?.method || '').toLowerCase();
+    const reference = String(req.body?.reference || '').trim();
+    const methodId = String(req.body?.methodId || '').trim();
+
+    if (method !== 'upi' && method !== 'crypto') {
+      return res.status(400).json({ error: 'Choose a valid payment method' });
+    }
+    if (method === 'upi' && !settings.upiEnabled) {
+      return res.status(400).json({ error: 'UPI payments are currently disabled' });
+    }
+    if (method === 'crypto' && !settings.cryptoEnabled) {
+      return res.status(400).json({ error: 'Crypto payments are currently disabled' });
+    }
+    if (!Number.isFinite(amountPaise) || amountPaise < settings.minDepositPaise) {
+      return res.status(400).json({
+        error: `Minimum deposit is ₹${toRupees(settings.minDepositPaise)}`,
+      });
+    }
+    if (reference.length < 6) {
+      return res.status(400).json({
+        error: method === 'upi'
+          ? 'Enter the 12-digit UTR / reference number from your payment app'
+          : 'Enter the transaction hash',
+      });
+    }
+
+    // A UTR is unique per payment; block re-use so one payment can't be
+    // claimed twice (by the same user or a different one).
+    const duplicate = await Deposit.findOne({ reference });
+    if (duplicate) {
+      return res.status(409).json({
+        error: 'This reference number has already been submitted',
+      });
+    }
+
+    const deposit = await Deposit.create({
+      userId: String(req.user._id),
+      userEmail: req.user.email,
+      amountPaise,
+      method,
+      methodId,
+      reference,
+    });
+
+    log(`💰 Deposit request ₹${toRupees(amountPaise)} from ${req.user.email} (${reference})`);
+    res.status(201).json({
+      success: true,
+      deposit: {
+        id: String(deposit._id),
+        amount: toRupees(deposit.amountPaise),
+        status: deposit.status,
+        createdAt: deposit.createdAt,
+      },
+      message: 'Submitted. Your wallet will be credited once the payment is verified.',
+    });
+  } catch (e) {
+    if (e?.code === 11000) {
+      return res.status(409).json({ error: 'This reference number has already been submitted' });
+    }
+    err('POST /api/wallet/deposit:', e?.message || e);
+    res.status(500).json({ error: 'Could not submit deposit' });
+  }
+});
+
+/* ---- Admin: deposit queue ---- */
+app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
+  try {
+    const status = String(req.query?.status || 'pending');
+    const filter = status === 'all' ? {} : { status };
+    const deposits = await Deposit.find(filter).sort({ createdAt: -1 }).limit(200).lean();
+    const pendingCount = await Deposit.countDocuments({ status: 'pending' });
+
+    res.json({
+      pendingCount,
+      deposits: deposits.map(d => ({
+        id: String(d._id),
+        userId: d.userId,
+        userEmail: d.userEmail,
+        amount: toRupees(d.amountPaise),
+        method: d.method,
+        methodId: d.methodId,
+        reference: d.reference,
+        status: d.status,
+        adminNote: d.adminNote,
+        createdAt: d.createdAt,
+        reviewedAt: d.reviewedAt,
+      })),
+    });
+  } catch (e) {
+    err('GET /api/admin/deposits:', e?.message || e);
+    res.status(500).json({ error: 'Could not load deposits' });
+  }
+});
+
+/* ---- Admin: approve or reject a deposit ---- */
+app.post('/api/admin/deposits/:id/review', requireAdmin, async (req, res) => {
+  try {
+    const action = String(req.body?.action || '');
+    const note = String(req.body?.note || '').trim();
+    if (action !== 'approve' && action !== 'reject') {
+      return res.status(400).json({ error: 'action must be approve or reject' });
+    }
+
+    // Only flip a deposit that is still pending. This guard makes a
+    // double-click (or two admins) unable to credit the wallet twice.
+    const deposit = await Deposit.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      {
+        $set: {
+          status: action === 'approve' ? 'approved' : 'rejected',
+          adminNote: note,
+          reviewedAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!deposit) {
+      return res.status(409).json({ error: 'Deposit not found or already reviewed' });
+    }
+
+    let balance = null;
+    if (action === 'approve') {
+      balance = await creditWallet(deposit.userId, deposit.amountPaise, {
+        type: 'deposit',
+        note: `${deposit.method.toUpperCase()} deposit — ${deposit.reference}`,
+        reference: String(deposit._id),
+      });
+      log(`✅ Deposit approved: ₹${toRupees(deposit.amountPaise)} → ${deposit.userEmail}`);
+    } else {
+      log(`❌ Deposit rejected: ${deposit.reference} (${deposit.userEmail})`);
+    }
+
+    res.json({
+      success: true,
+      status: deposit.status,
+      newBalance: balance == null ? null : toRupees(balance),
+    });
+  } catch (e) {
+    err('POST /api/admin/deposits/:id/review:', e?.message || e);
+    res.status(500).json({ error: 'Could not review deposit' });
+  }
+});
+
+/* ---- Admin: manual wallet adjustment ---- */
+app.post('/api/admin/users/:id/wallet', requireAdmin, async (req, res) => {
+  try {
+    const amountPaise = toPaise(req.body?.amount);
+    const note = String(req.body?.note || 'Manual adjustment').trim();
+    if (!Number.isFinite(amountPaise) || amountPaise === 0) {
+      return res.status(400).json({ error: 'Enter a non-zero amount' });
+    }
+
+    if (amountPaise > 0) {
+      const balance = await creditWallet(req.params.id, amountPaise, {
+        type: 'admin_credit', note,
+      });
+      return res.json({ success: true, balance: toRupees(balance) });
+    }
+
+    const result = await debitWallet(req.params.id, Math.abs(amountPaise), {
+      type: 'admin_debit', note,
+    });
+    if (!result.ok) return res.status(400).json({ error: 'User balance is too low' });
+    res.json({ success: true, balance: toRupees(result.balance) });
+  } catch (e) {
+    err('POST /api/admin/users/:id/wallet:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not adjust wallet' });
+  }
+});
+
+/* ---- Admin: payment settings ---- */
+app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
+  try {
+    const doc = await getPaymentSettings();
+    res.json({
+      minDeposit: toRupees(doc.minDepositPaise),
+      markupPercent: doc.markupPercent,
+      upiEnabled: doc.upiEnabled,
+      cryptoEnabled: doc.cryptoEnabled,
+      upiMethods: doc.upiMethods || [],
+      cryptoMethods: doc.cryptoMethods || [],
+      updatedAt: doc.updatedAt,
+    });
+  } catch (e) {
+    err('GET /api/admin/payment-settings:', e?.message || e);
+    res.status(500).json({ error: 'Could not load payment settings' });
+  }
+});
+
+app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
+  try {
+    const doc = await getPaymentSettings();
+    const body = req.body || {};
+
+    if (body.minDeposit !== undefined) {
+      const paise = toPaise(body.minDeposit);
+      if (!Number.isFinite(paise) || paise < 100) {
+        return res.status(400).json({ error: 'Minimum deposit must be at least ₹1' });
+      }
+      doc.minDepositPaise = paise;
+    }
+    if (body.markupPercent !== undefined) {
+      const pct = Number(body.markupPercent);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 1000) {
+        return res.status(400).json({ error: 'Markup must be between 0 and 1000%' });
+      }
+      doc.markupPercent = pct;
+    }
+    if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
+    if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
+
+    if (Array.isArray(body.upiMethods)) {
+      doc.upiMethods = body.upiMethods.slice(0, 10).map((m, i) => ({
+        id: String(m?.id || `upi-${Date.now()}-${i}`),
+        label: String(m?.label || '').trim(),
+        upiId: String(m?.upiId || '').trim(),
+        payeeName: String(m?.payeeName || '').trim(),
+        instructions: String(m?.instructions || '').trim(),
+        isActive: m?.isActive !== false,
+      }));
+    }
+    if (Array.isArray(body.cryptoMethods)) {
+      doc.cryptoMethods = body.cryptoMethods.slice(0, 10).map((m, i) => ({
+        id: String(m?.id || `crypto-${Date.now()}-${i}`),
+        label: String(m?.label || '').trim(),
+        network: String(m?.network || '').trim(),
+        address: String(m?.address || '').trim(),
+        instructions: String(m?.instructions || '').trim(),
+        isActive: m?.isActive !== false,
+      }));
+    }
+
+    doc.updatedAt = new Date();
+    await doc.save();
+    log('⚙️  Payment settings updated');
+    res.json({ success: true });
+  } catch (e) {
+    err('POST /api/admin/payment-settings:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not save payment settings' });
   }
 });
 
@@ -1715,6 +2291,7 @@ app.get('/api/admin/users', requireAdmin, async (_req, res) => {
         email: u.email,
         name: u.name || '',
         isActive: u.isActive !== false,
+        balance: toRupees(u.balancePaise),
         createdAt: u.createdAt,
         lastLoginAt: u.lastLoginAt,
         orderCount: byUser.get(String(u._id)) || 0,
