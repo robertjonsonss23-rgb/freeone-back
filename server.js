@@ -1283,6 +1283,112 @@ app.post('/api/auth/change-password', requireUser, async (req, res) => {
    ============================================================ */
 
 // ---- Public: what the New Order page needs (NEVER returns the API key) ----
+/* ---- Price quote ----
+   The panel's per-service rates can only be read with the admin API key, so
+   the calculation happens here and only the final numbers go to the browser.
+   Body: { services: { views: 12000, likes: 300, ... } }  (total units each) */
+app.post('/api/quote', requireUser, async (req, res) => {
+  try {
+    const cfg = await getPanelConfig();
+    if (!cfg.apiUrl || !cfg.apiKey) {
+      return res.status(503).json({ error: 'No SMM panel configured yet.' });
+    }
+
+    const requested = req.body?.services && typeof req.body.services === 'object'
+      ? req.body.services
+      : {};
+
+    // Pull the live catalogue so rates are always current.
+    const params = new URLSearchParams({ key: cfg.apiKey, action: 'services' });
+    const response = await axios.post(cfg.apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: PROVIDER_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+
+    const data = response.data;
+    if (data && data.error) return res.status(400).json({ error: String(data.error) });
+    const catalogue = Array.isArray(data) ? data
+      : Array.isArray(data?.services) ? data.services
+      : Array.isArray(data?.data) ? data.data
+      : [];
+
+    const rateById = new Map();
+    for (const row of catalogue) {
+      const id = String(row?.service ?? row?.id ?? '').trim();
+      const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
+        .replace(/[^\d.]/g, ''));
+      if (id && Number.isFinite(rate)) rateById.set(id, rate);
+    }
+
+    // Detect the panel's currency so we can convert to INR.
+    let currency = null;
+    try {
+      const balanceParams = new URLSearchParams({ key: cfg.apiKey, action: 'balance' });
+      const balanceRes = await axios.post(cfg.apiUrl, balanceParams.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: PROVIDER_HTTP_TIMEOUT_MS,
+        validateStatus: () => true,
+      });
+      currency = extractPanelCurrency(balanceRes.data);
+    } catch { /* fall through */ }
+
+    let exchangeRateToInr = 1;
+    let rateUpdatedAt = null;
+    if (currency && currency !== 'INR') {
+      try {
+        const fx = await getInrExchangeRate(currency);
+        exchangeRateToInr = fx.rate;
+        rateUpdatedAt = fx.updatedAt;
+      } catch (e) {
+        warn('Quote: FX lookup failed:', e?.message || e);
+        return res.json({
+          available: false,
+          reason: `Could not convert ${currency} to INR right now.`,
+        });
+      }
+    }
+
+    const breakdown = {};
+    let nativeTotal = 0;
+    let missingRate = false;
+
+    for (const label of SERVICE_LABELS) {
+      const units = Math.max(0, Math.floor(Number(requested[label]) || 0));
+      if (units <= 0) continue;
+
+      const serviceId = String(cfg.serviceIds?.[label] || '').trim();
+      if (!serviceId) continue;
+
+      const rate = rateById.get(serviceId);
+      if (!Number.isFinite(rate) || rate <= 0) { missingRate = true; continue; }
+
+      // Standard SMM panels quote a price per 1,000 units.
+      const native = (units / 1000) * rate;
+      nativeTotal += native;
+      breakdown[label] = Math.round(native * exchangeRateToInr * 100) / 100;
+    }
+
+    if (missingRate && nativeTotal === 0) {
+      return res.json({ available: false, reason: 'Panel did not return usable rates.' });
+    }
+
+    return res.json({
+      available: true,
+      total: Math.round(nativeTotal * exchangeRateToInr * 100) / 100,
+      breakdown,
+      currency: currency || 'INR',
+      nativeTotal: Math.round(nativeTotal * 10000) / 10000,
+      exchangeRateToInr,
+      exchangeRateUpdatedAt: rateUpdatedAt,
+      partial: missingRate,
+    });
+  } catch (e) {
+    err('POST /api/quote:', e?.message || e);
+    return res.status(500).json({ error: e?.message || 'Could not calculate price' });
+  }
+});
+
 app.get('/api/panel-config', async (_req, res) => {
   try {
     const doc = await getPanelConfig();
