@@ -18,7 +18,22 @@ const mongoose = require('mongoose');
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+/* ---- CORS ----
+   Set ALLOWED_ORIGINS in Render to a comma-separated list of your frontend
+   origins, e.g. "https://your-new-frontend.vercel.app,http://localhost:5173".
+   If unset, all origins are allowed (fine for testing, tighten for prod). */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || ALLOWED_ORIGINS.length === 0) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+}));
 app.use(express.json({ limit: '1mb' }));
 
 /* ============================================================
@@ -975,6 +990,11 @@ app.post('/api/runs/retry-stuck', async (_req, res) => {
 app.post('/api/scheduler/trigger', async (_req, res) => {
   await schedulerTick();
   res.json({ success: true });
+});
+
+// ---- Root (Render health check / uptime pinger) ----
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok', service: 'truesmm-backend', uptime: process.uptime() });
 });
 
 // ---- Health ----
