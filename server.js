@@ -129,6 +129,28 @@ const SettingsSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+/* Admin-managed panel configuration.
+   Exactly ONE document (singleton, key: 'default') holds the SMM panel
+   credentials and the service id for each engagement label. Regular users
+   never send credentials — the server reads them from here. */
+const PanelConfigSchema = new mongoose.Schema({
+  key:        { type: String, required: true, unique: true, default: 'default' },
+  panelName:  { type: String, default: '' },
+  apiUrl:     { type: String, default: '' },
+  apiKey:     { type: String, default: '' },
+  serviceIds: {
+    views:    { type: String, default: '' },
+    likes:    { type: String, default: '' },
+    shares:   { type: String, default: '' },
+    saves:    { type: String, default: '' },
+    comments: { type: String, default: '' },
+    reposts:  { type: String, default: '' },
+  },
+  updatedAt:  { type: Date, default: Date.now },
+});
+
+const PanelConfig = mongoose.model('PanelConfig', PanelConfigSchema);
+
 const Run      = mongoose.model('Run', RunSchema);
 const Order    = mongoose.model('Order', OrderSchema);
 const Settings = mongoose.model('Settings', SettingsSchema);
@@ -137,6 +159,56 @@ const Settings = mongoose.model('Settings', SettingsSchema);
    SETTINGS (loaded from DB at boot)
    ============================================================ */
 let MIN_VIEWS_PER_RUN = 100;
+
+/* ============================================================
+   ADMIN AUTH
+   Set ADMIN_PASSWORD in Render. Admin requests must send it in the
+   `x-admin-password` header. Checked SERVER-SIDE, so the secret is
+   never shipped in the frontend bundle.
+   ============================================================ */
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+if (!ADMIN_PASSWORD) {
+  warn('ADMIN_PASSWORD is not set — admin routes are DISABLED until you set it in Render.');
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_PASSWORD) {
+    return res.status(503).json({ error: 'Admin disabled: ADMIN_PASSWORD is not configured on the server.' });
+  }
+  const supplied = String(req.headers['x-admin-password'] || '');
+  // Length-independent comparison; avoids leaking length via early exit.
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(ADMIN_PASSWORD);
+  const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+  if (!ok) return res.status(401).json({ error: 'Invalid admin password' });
+  next();
+}
+
+const SERVICE_LABELS = ['views', 'likes', 'shares', 'saves', 'comments', 'reposts'];
+
+/** Read the singleton panel config, creating an empty one on first call. */
+async function getPanelConfig() {
+  let doc = await PanelConfig.findOne({ key: 'default' });
+  if (!doc) doc = await PanelConfig.create({ key: 'default' });
+  return doc;
+}
+
+/** Strip the API key before sending config to any client. */
+function publicPanelConfig(doc) {
+  const serviceIds = {};
+  for (const label of SERVICE_LABELS) {
+    serviceIds[label] = String(doc?.serviceIds?.[label] || '');
+  }
+  return {
+    panelName:  doc?.panelName || '',
+    apiUrl:     doc?.apiUrl || '',
+    hasApiKey:  Boolean(doc?.apiKey),
+    apiKeyMask: doc?.apiKey ? `••••••••${String(doc.apiKey).slice(-4)}` : '',
+    serviceIds,
+    configured: Boolean(doc?.apiUrl && doc?.apiKey && doc?.serviceIds?.views),
+    updatedAt:  doc?.updatedAt || null,
+  };
+}
 
 async function loadSettings() {
   try {
@@ -620,13 +692,43 @@ process.on('SIGTERM', async () => {
 // ---- Create order ----
 app.post('/api/order', async (req, res) => {
   try {
-    const { apiUrl, apiKey, link, services, name } = req.body || {};
-    if (!apiUrl || !apiKey || !link || !services) {
+    const { link, services, name } = req.body || {};
+    if (!link || !services) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    /* Credentials come from the admin-managed config, NEVER from the client.
+       Service ids are likewise resolved server-side, so a user cannot order
+       an arbitrary service by tampering with the request. */
+    const cfg = await getPanelConfig();
+    if (!cfg.apiUrl || !cfg.apiKey) {
+      return res.status(503).json({ error: 'No SMM panel configured yet. Ask the admin to set one up.' });
+    }
+
+    const resolved = {};
+    for (const [label, value] of Object.entries(services)) {
+      if (!value) continue;
+      const normalized = String(label).toLowerCase();
+      if (!SERVICE_LABELS.includes(normalized)) continue;
+
+      const serviceId = String(cfg.serviceIds?.[normalized] || '').trim();
+      if (!serviceId) {
+        log(`[ORDER] Skipping "${normalized}" — no service id configured by admin`);
+        continue;
+      }
+      resolved[normalized] = { serviceId, runs: value.runs || [] };
+    }
+
+    if (Object.keys(resolved).length === 0) {
+      return res.status(400).json({ error: 'None of the requested services are configured by the admin.' });
+    }
+
     const schedulerOrderId = makeOrderId();
-    const runs = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
+    const runs = await addRuns(
+      resolved,
+      { apiUrl: cfg.apiUrl, apiKey: cfg.apiKey, link },
+      schedulerOrderId
+    );
 
     const orderDoc = await Order.create({
       schedulerOrderId,
@@ -990,6 +1092,112 @@ app.post('/api/runs/retry-stuck', async (_req, res) => {
 app.post('/api/scheduler/trigger', async (_req, res) => {
   await schedulerTick();
   res.json({ success: true });
+});
+
+/* ============================================================
+   PANEL CONFIG ROUTES
+   ============================================================ */
+
+// ---- Public: what the New Order page needs (NEVER returns the API key) ----
+app.get('/api/panel-config', async (_req, res) => {
+  try {
+    const doc = await getPanelConfig();
+    res.json(publicPanelConfig(doc));
+  } catch (e) {
+    err('GET /api/panel-config:', e?.message || e);
+    res.status(500).json({ error: 'Could not load panel configuration' });
+  }
+});
+
+// ---- Admin: verify password (used by the admin login screen) ----
+app.post('/api/admin/verify', requireAdmin, (_req, res) => {
+  res.json({ success: true });
+});
+
+// ---- Admin: read config, including which service ids are set ----
+app.get('/api/admin/panel-config', requireAdmin, async (_req, res) => {
+  try {
+    const doc = await getPanelConfig();
+    res.json(publicPanelConfig(doc));
+  } catch (e) {
+    err('GET /api/admin/panel-config:', e?.message || e);
+    res.status(500).json({ error: 'Could not load panel configuration' });
+  }
+});
+
+// ---- Admin: save panel + service ids ----
+app.post('/api/admin/panel-config', requireAdmin, async (req, res) => {
+  try {
+    const { panelName, apiUrl, apiKey, serviceIds } = req.body || {};
+
+    const doc = await getPanelConfig();
+
+    if (typeof panelName === 'string') doc.panelName = panelName.trim();
+
+    if (typeof apiUrl === 'string' && apiUrl.trim()) {
+      const valid = validateProviderUrl(apiUrl);
+      if (!valid) return res.status(400).json({ error: 'API URL must be a valid http(s) URL' });
+      doc.apiUrl = apiUrl.trim();
+    }
+
+    // Only overwrite the key when a new non-empty value is supplied, so the
+    // admin can edit service ids without re-typing the key every time.
+    if (typeof apiKey === 'string' && apiKey.trim()) {
+      doc.apiKey = apiKey.trim();
+    }
+
+    if (serviceIds && typeof serviceIds === 'object') {
+      for (const label of SERVICE_LABELS) {
+        if (label in serviceIds) {
+          doc.serviceIds[label] = String(serviceIds[label] ?? '').trim();
+        }
+      }
+    }
+
+    doc.updatedAt = new Date();
+    await doc.save();
+    log(`⚙️  Panel config updated (${doc.panelName || doc.apiUrl})`);
+    res.json({ success: true, ...publicPanelConfig(doc) });
+  } catch (e) {
+    err('POST /api/admin/panel-config:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not save panel configuration' });
+  }
+});
+
+// ---- Admin: fetch the service catalogue using the STORED credentials ----
+app.post('/api/admin/services', requireAdmin, async (req, res) => {
+  try {
+    const doc = await getPanelConfig();
+    // Allow testing an unsaved panel by passing overrides.
+    const apiUrl = String(req.body?.apiUrl || doc.apiUrl || '').trim();
+    const apiKey = String(req.body?.apiKey || doc.apiKey || '').trim();
+    if (!apiUrl || !apiKey) {
+      return res.status(400).json({ error: 'Panel URL and API key are required' });
+    }
+    if (!validateProviderUrl(apiUrl)) {
+      return res.status(400).json({ error: 'API URL must be a valid http(s) URL' });
+    }
+
+    const params = new URLSearchParams({ key: apiKey, action: 'services' });
+    const response = await axios.post(apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: PROVIDER_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+
+    const data = response.data;
+    if (data && data.error) return res.status(400).json({ error: String(data.error) });
+
+    const list = Array.isArray(data) ? data
+      : Array.isArray(data?.services) ? data.services
+      : Array.isArray(data?.data) ? data.data
+      : [];
+
+    res.json({ success: true, services: list });
+  } catch (e) {
+    err('POST /api/admin/services:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not reach the SMM panel' });
+  }
 });
 
 // ---- Root (Render health check / uptime pinger) ----
