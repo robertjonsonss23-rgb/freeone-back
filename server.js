@@ -34,7 +34,7 @@ app.use(cors({
     return cb(new Error(`Origin ${origin} not allowed by CORS`));
   },
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '12mb' }));   // QR images travel as base64 data URLs
 
 /* ============================================================
    CONFIG
@@ -201,6 +201,8 @@ const PaymentSettingsSchema = new mongoose.Schema({
     upiId:       { type: String, default: '' },
     payeeName:   { type: String, default: '' },
     instructions:{ type: String, default: '' },
+    // Scannable QR, stored as a base64 data URL.
+    qrImage:     { type: String, default: '' },
     isActive:    { type: Boolean, default: true },
   }],
   cryptoMethods: [{
@@ -210,6 +212,7 @@ const PaymentSettingsSchema = new mongoose.Schema({
     network:     { type: String, default: '' },
     address:     { type: String, default: '' },
     instructions:{ type: String, default: '' },
+    qrImage:     { type: String, default: '' },
     isActive:    { type: Boolean, default: true },
   }],
   updatedAt:        { type: Date, default: Date.now },
@@ -486,6 +489,22 @@ async function debitWallet(userId, amountPaise, { type, note = '', reference = '
   return { ok: true, balance: user.balancePaise };
 }
 
+/* Accept only real image data URLs, and cap the size so the settings
+   document can't be bloated by an unbounded upload. */
+const MAX_QR_BYTES = 2 * 1024 * 1024;   // 2 MB decoded
+function sanitizeQrImage(value, previous = '') {
+  if (value === undefined) return previous;          // field omitted -> keep
+  const raw = String(value || '').trim();
+  if (!raw) return '';                                // explicit clear
+  const match = /^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)$/.exec(raw);
+  if (!match) throw new Error('QR must be a PNG, JPG, WEBP or GIF image');
+  const bytes = Math.floor(match[2].length * 3 / 4);
+  if (bytes > MAX_QR_BYTES) {
+    throw new Error(`QR image is too large (${(bytes / 1024 / 1024).toFixed(1)} MB, max 2 MB)`);
+  }
+  return raw;
+}
+
 /** Public view of the payment options a user can pay with. */
 function publicPaymentSettings(doc) {
   return {
@@ -497,12 +516,14 @@ function publicPaymentSettings(doc) {
       .map(m => ({
         id: m.id, label: m.label, upiId: m.upiId,
         payeeName: m.payeeName, instructions: m.instructions,
+        qrImage: m.qrImage || '',
       })),
     cryptoMethods: (doc.cryptoMethods || [])
       .filter(m => m.isActive)
       .map(m => ({
         id: m.id, label: m.label, network: m.network,
         address: m.address, instructions: m.instructions,
+        qrImage: m.qrImage || '',
       })),
   };
 }
@@ -2095,24 +2116,34 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
 
     if (Array.isArray(body.upiMethods)) {
-      doc.upiMethods = body.upiMethods.slice(0, 10).map((m, i) => ({
-        id: String(m?.id || `upi-${Date.now()}-${i}`),
-        label: String(m?.label || '').trim(),
-        upiId: String(m?.upiId || '').trim(),
-        payeeName: String(m?.payeeName || '').trim(),
-        instructions: String(m?.instructions || '').trim(),
-        isActive: m?.isActive !== false,
-      }));
+      const existing = new Map((doc.upiMethods || []).map(m => [m.id, m]));
+      doc.upiMethods = body.upiMethods.slice(0, 10).map((m, i) => {
+        const id = String(m?.id || `upi-${Date.now()}-${i}`);
+        return {
+          id,
+          label: String(m?.label || '').trim(),
+          upiId: String(m?.upiId || '').trim(),
+          payeeName: String(m?.payeeName || '').trim(),
+          instructions: String(m?.instructions || '').trim(),
+          qrImage: sanitizeQrImage(m?.qrImage, existing.get(id)?.qrImage || ''),
+          isActive: m?.isActive !== false,
+        };
+      });
     }
     if (Array.isArray(body.cryptoMethods)) {
-      doc.cryptoMethods = body.cryptoMethods.slice(0, 10).map((m, i) => ({
-        id: String(m?.id || `crypto-${Date.now()}-${i}`),
-        label: String(m?.label || '').trim(),
-        network: String(m?.network || '').trim(),
-        address: String(m?.address || '').trim(),
-        instructions: String(m?.instructions || '').trim(),
-        isActive: m?.isActive !== false,
-      }));
+      const existing = new Map((doc.cryptoMethods || []).map(m => [m.id, m]));
+      doc.cryptoMethods = body.cryptoMethods.slice(0, 10).map((m, i) => {
+        const id = String(m?.id || `crypto-${Date.now()}-${i}`);
+        return {
+          id,
+          label: String(m?.label || '').trim(),
+          network: String(m?.network || '').trim(),
+          address: String(m?.address || '').trim(),
+          instructions: String(m?.instructions || '').trim(),
+          qrImage: sanitizeQrImage(m?.qrImage, existing.get(id)?.qrImage || ''),
+          isActive: m?.isActive !== false,
+        };
+      });
     }
 
     doc.updatedAt = new Date();
@@ -2120,8 +2151,10 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     log('⚙️  Payment settings updated');
     res.json({ success: true });
   } catch (e) {
-    err('POST /api/admin/payment-settings:', e?.message || e);
-    res.status(500).json({ error: e?.message || 'Could not save payment settings' });
+    const msg = e?.message || 'Could not save payment settings';
+    if (/QR (must|image)/i.test(msg)) return res.status(400).json({ error: msg });
+    err('POST /api/admin/payment-settings:', msg);
+    res.status(500).json({ error: msg });
   }
 });
 
