@@ -154,12 +154,31 @@ const SessionSchema = new mongoose.Schema({
   expiresAt: { type: Date, required: true, index: true },
 });
 
-/* Admin-managed panel configuration.
-   Exactly ONE document (singleton, key: 'default') holds the SMM panel
-   credentials and the service id for each engagement label. Regular users
-   never send credentials — the server reads them from here. */
+/* An SMM provider. The admin can register several; credentials never
+   leave the server. */
+const PanelSchema = new mongoose.Schema({
+  name:      { type: String, required: true },
+  apiUrl:    { type: String, required: true },
+  apiKey:    { type: String, required: true },
+  isActive:  { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+/* Admin-managed service mapping (singleton, key: 'default').
+   Each engagement label holds an ORDERED list of slots. When a label has
+   more than one slot the scheduler rotates through them run by run, so
+   consecutive runs hit different services (and possibly different panels).
+   `serviceIds` is the legacy single-service shape, kept only so existing
+   installs can be migrated on boot. */
+const SlotSchema = new mongoose.Schema({
+  panelId:   { type: String, required: true },
+  serviceId: { type: String, required: true },
+}, { _id: false });
+
 const PanelConfigSchema = new mongoose.Schema({
   key:        { type: String, required: true, unique: true, default: 'default' },
+  // Legacy fields (pre-multi-panel). Migrated then left untouched.
   panelName:  { type: String, default: '' },
   apiUrl:     { type: String, default: '' },
   apiKey:     { type: String, default: '' },
@@ -171,10 +190,20 @@ const PanelConfigSchema = new mongoose.Schema({
     comments: { type: String, default: '' },
     reposts:  { type: String, default: '' },
   },
+  serviceSlots: {
+    views:    { type: [SlotSchema], default: [] },
+    likes:    { type: [SlotSchema], default: [] },
+    shares:   { type: [SlotSchema], default: [] },
+    saves:    { type: [SlotSchema], default: [] },
+    comments: { type: [SlotSchema], default: [] },
+    reposts:  { type: [SlotSchema], default: [] },
+  },
+  migratedToSlots: { type: Boolean, default: false },
   updatedAt:  { type: Date, default: Date.now },
 });
 
 const PanelConfig = mongoose.model('PanelConfig', PanelConfigSchema);
+const Panel       = mongoose.model('Panel', PanelSchema);
 
 const User     = mongoose.model('User', UserSchema);
 const Session  = mongoose.model('Session', SessionSchema);
@@ -318,20 +347,110 @@ async function getPanelConfig() {
   return doc;
 }
 
-/** Strip the API key before sending config to any client. */
-function publicPanelConfig(doc) {
-  const serviceIds = {};
+/* One-time upgrade from the single-panel shape to panels + slots.
+   Existing installs keep working with no manual re-entry. */
+async function migrateToMultiPanel() {
+  const cfg = await getPanelConfig();
+  if (cfg.migratedToSlots) return;
+
+  // Nothing configured yet: just flag it and move on.
+  if (!cfg.apiUrl || !cfg.apiKey) {
+    cfg.migratedToSlots = true;
+    await cfg.save();
+    return;
+  }
+
+  let panel = await Panel.findOne({ apiUrl: cfg.apiUrl, apiKey: cfg.apiKey });
+  if (!panel) {
+    panel = await Panel.create({
+      name: cfg.panelName || 'Panel 1',
+      apiUrl: cfg.apiUrl,
+      apiKey: cfg.apiKey,
+    });
+    log(`🔀 Migrated existing panel "${panel.name}" into the panels collection`);
+  }
+
   for (const label of SERVICE_LABELS) {
-    serviceIds[label] = String(doc?.serviceIds?.[label] || '');
+    const legacyId = String(cfg.serviceIds?.[label] || '').trim();
+    if (legacyId && (cfg.serviceSlots?.[label] || []).length === 0) {
+      cfg.serviceSlots[label] = [{ panelId: String(panel._id), serviceId: legacyId }];
+    }
+  }
+
+  cfg.migratedToSlots = true;
+  cfg.updatedAt = new Date();
+  await cfg.save();
+  log('🔀 Service mapping migrated to rotating slots');
+}
+
+/** Slots for a label, dropping any that point at a missing/inactive panel. */
+function usableSlots(cfg, label, panelsById) {
+  const slots = (cfg?.serviceSlots?.[label] || []).map(s => ({
+    panelId: String(s.panelId || ''),
+    serviceId: String(s.serviceId || '').trim(),
+  }));
+  return slots.filter(s => {
+    if (!s.serviceId) return false;
+    const panel = panelsById.get(s.panelId);
+    return Boolean(panel && panel.isActive !== false);
+  });
+}
+
+async function loadPanelsById() {
+  const panels = await Panel.find().lean();
+  return new Map(panels.map(p => [String(p._id), p]));
+}
+
+/** Public view: service ids and panel names, never an API key. */
+async function publicPanelConfig(doc) {
+  const panelsById = await loadPanelsById();
+  const services = {};
+  for (const label of SERVICE_LABELS) {
+    const slots = usableSlots(doc, label, panelsById);
+    services[label] = {
+      enabled: slots.length > 0,
+      count: slots.length,
+      rotating: slots.length > 1,
+      slots: slots.map(s => ({
+        serviceId: s.serviceId,
+        panelId: s.panelId,
+        panelName: panelsById.get(s.panelId)?.name || 'Unknown panel',
+      })),
+    };
+  }
+  const activePanels = [...panelsById.values()].filter(p => p.isActive !== false);
+  return {
+    panels: activePanels.map(p => ({ id: String(p._id), name: p.name })),
+    services,
+    configured: services.views.enabled,
+    updatedAt: doc?.updatedAt || null,
+  };
+}
+
+/** Admin view: adds per-panel detail plus masked keys. */
+async function adminPanelConfig(doc) {
+  const panels = await Panel.find().sort({ createdAt: 1 }).lean();
+  const panelsById = new Map(panels.map(p => [String(p._id), p]));
+  const serviceSlots = {};
+  for (const label of SERVICE_LABELS) {
+    serviceSlots[label] = (doc?.serviceSlots?.[label] || []).map(s => ({
+      panelId: String(s.panelId || ''),
+      serviceId: String(s.serviceId || ''),
+      panelName: panelsById.get(String(s.panelId))?.name || 'Missing panel',
+    }));
   }
   return {
-    panelName:  doc?.panelName || '',
-    apiUrl:     doc?.apiUrl || '',
-    hasApiKey:  Boolean(doc?.apiKey),
-    apiKeyMask: doc?.apiKey ? `••••••••${String(doc.apiKey).slice(-4)}` : '',
-    serviceIds,
-    configured: Boolean(doc?.apiUrl && doc?.apiKey && doc?.serviceIds?.views),
-    updatedAt:  doc?.updatedAt || null,
+    panels: panels.map(p => ({
+      id: String(p._id),
+      name: p.name,
+      apiUrl: p.apiUrl,
+      apiKeyMask: p.apiKey ? `••••••••${String(p.apiKey).slice(-4)}` : '',
+      isActive: p.isActive !== false,
+      createdAt: p.createdAt,
+    })),
+    serviceSlots,
+    configured: usableSlots(doc, 'views', panelsById).length > 0,
+    updatedAt: doc?.updatedAt || null,
   };
 }
 
@@ -427,7 +546,15 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     if (!serviceConfig) continue;
     const label = key.toUpperCase();
 
+    // Rotate across the admin's slots: run 0 -> slot 0, run 1 -> slot 1, …
+    // wrapping around. With one slot this is identical to the old behaviour.
+    const slots = Array.isArray(serviceConfig.slots) ? serviceConfig.slots : [];
+    if (slots.length === 0) continue;
+    let runIndex = -1;
+
     for (const run of (serviceConfig.runs || [])) {
+      runIndex += 1;
+      const slot = slots[runIndex % slots.length];
       let quantity;
       let commentsText = null;
 
@@ -479,9 +606,9 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         id: makeRunId(),
         schedulerOrderId,
         label,
-        apiUrl: baseConfig.apiUrl,
-        apiKey: baseConfig.apiKey,
-        service: serviceConfig.serviceId,
+        apiUrl: slot.apiUrl,
+        apiKey: slot.apiKey,
+        service: slot.serviceId,
         link: baseConfig.link,
         quantity,
         time: scheduledTime,
@@ -770,6 +897,7 @@ async function start() {
   log('✅ MongoDB connected');
 
   await loadSettings();
+  await migrateToMultiPanel();
 
   // Drop expired sessions so the collection doesn't grow without bound.
   const purged = await Session.deleteMany({ expiresAt: { $lt: new Date() } });
@@ -830,9 +958,7 @@ app.post('/api/order', requireUser, async (req, res) => {
        Service ids are likewise resolved server-side, so a user cannot order
        an arbitrary service by tampering with the request. */
     const cfg = await getPanelConfig();
-    if (!cfg.apiUrl || !cfg.apiKey) {
-      return res.status(503).json({ error: 'No SMM panel configured yet. Ask the admin to set one up.' });
-    }
+    const panelsById = await loadPanelsById();
 
     const resolved = {};
     for (const [label, value] of Object.entries(services)) {
@@ -840,24 +966,33 @@ app.post('/api/order', requireUser, async (req, res) => {
       const normalized = String(label).toLowerCase();
       if (!SERVICE_LABELS.includes(normalized)) continue;
 
-      const serviceId = String(cfg.serviceIds?.[normalized] || '').trim();
-      if (!serviceId) {
-        log(`[ORDER] Skipping "${normalized}" — no service id configured by admin`);
+      // Attach each slot's own panel credentials so runs can rotate across
+      // different providers.
+      const slots = usableSlots(cfg, normalized, panelsById).map(slot => {
+        const panel = panelsById.get(slot.panelId);
+        return {
+          serviceId: slot.serviceId,
+          panelId: slot.panelId,
+          apiUrl: panel.apiUrl,
+          apiKey: panel.apiKey,
+        };
+      });
+
+      if (slots.length === 0) {
+        log(`[ORDER] Skipping "${normalized}" — no usable service slot configured`);
         continue;
       }
-      resolved[normalized] = { serviceId, runs: value.runs || [] };
+      resolved[normalized] = { slots, runs: value.runs || [] };
     }
 
     if (Object.keys(resolved).length === 0) {
-      return res.status(400).json({ error: 'None of the requested services are configured by the admin.' });
+      return res.status(503).json({
+        error: 'No SMM services configured yet. Ask the admin to set one up.',
+      });
     }
 
     const schedulerOrderId = makeOrderId();
-    const runs = await addRuns(
-      resolved,
-      { apiUrl: cfg.apiUrl, apiKey: cfg.apiKey, link },
-      schedulerOrderId
-    );
+    const runs = await addRuns(resolved, { link }, schedulerOrderId);
 
     const orderDoc = await Order.create({
       schedulerOrderId,
@@ -1290,97 +1425,122 @@ app.post('/api/auth/change-password', requireUser, async (req, res) => {
 app.post('/api/quote', requireUser, async (req, res) => {
   try {
     const cfg = await getPanelConfig();
-    if (!cfg.apiUrl || !cfg.apiKey) {
-      return res.status(503).json({ error: 'No SMM panel configured yet.' });
-    }
+    const panelsById = await loadPanelsById();
 
     const requested = req.body?.services && typeof req.body.services === 'object'
       ? req.body.services
       : {};
 
-    // Pull the live catalogue so rates are always current.
-    const params = new URLSearchParams({ key: cfg.apiKey, action: 'services' });
-    const response = await axios.post(cfg.apiUrl, params.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: PROVIDER_HTTP_TIMEOUT_MS,
-      validateStatus: () => true,
-    });
+    // Fetch each involved panel's catalogue once, then reuse it.
+    const catalogueCache = new Map();   // panelId -> Map(serviceId -> rate)
+    const currencyCache = new Map();    // panelId -> currency code
 
-    const data = response.data;
-    if (data && data.error) return res.status(400).json({ error: String(data.error) });
-    const catalogue = Array.isArray(data) ? data
-      : Array.isArray(data?.services) ? data.services
-      : Array.isArray(data?.data) ? data.data
-      : [];
+    async function loadPanel(panelId) {
+      if (catalogueCache.has(panelId)) return;
+      const panel = panelsById.get(panelId);
+      if (!panel) { catalogueCache.set(panelId, new Map()); return; }
 
-    const rateById = new Map();
-    for (const row of catalogue) {
-      const id = String(row?.service ?? row?.id ?? '').trim();
-      const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
-        .replace(/[^\d.]/g, ''));
-      if (id && Number.isFinite(rate)) rateById.set(id, rate);
-    }
-
-    // Detect the panel's currency so we can convert to INR.
-    let currency = null;
-    try {
-      const balanceParams = new URLSearchParams({ key: cfg.apiKey, action: 'balance' });
-      const balanceRes = await axios.post(cfg.apiUrl, balanceParams.toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: PROVIDER_HTTP_TIMEOUT_MS,
-        validateStatus: () => true,
-      });
-      currency = extractPanelCurrency(balanceRes.data);
-    } catch { /* fall through */ }
-
-    let exchangeRateToInr = 1;
-    let rateUpdatedAt = null;
-    if (currency && currency !== 'INR') {
+      const rates = new Map();
       try {
-        const fx = await getInrExchangeRate(currency);
-        exchangeRateToInr = fx.rate;
-        rateUpdatedAt = fx.updatedAt;
-      } catch (e) {
-        warn('Quote: FX lookup failed:', e?.message || e);
-        return res.json({
-          available: false,
-          reason: `Could not convert ${currency} to INR right now.`,
+        const params = new URLSearchParams({ key: panel.apiKey, action: 'services' });
+        const response = await axios.post(panel.apiUrl, params.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: PROVIDER_HTTP_TIMEOUT_MS,
+          validateStatus: () => true,
         });
+        const data = response.data;
+        const list = Array.isArray(data) ? data
+          : Array.isArray(data?.services) ? data.services
+          : Array.isArray(data?.data) ? data.data
+          : [];
+        for (const row of list) {
+          const id = String(row?.service ?? row?.id ?? '').trim();
+          const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
+            .replace(/[^\d.]/g, ''));
+          if (id && Number.isFinite(rate)) rates.set(id, rate);
+        }
+      } catch (e) {
+        warn(`Quote: catalogue fetch failed for panel ${panel.name}:`, e?.message || e);
+      }
+      catalogueCache.set(panelId, rates);
+
+      // Currency, for INR conversion.
+      try {
+        const balanceParams = new URLSearchParams({ key: panel.apiKey, action: 'balance' });
+        const balanceRes = await axios.post(panel.apiUrl, balanceParams.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: PROVIDER_HTTP_TIMEOUT_MS,
+          validateStatus: () => true,
+        });
+        currencyCache.set(panelId, extractPanelCurrency(balanceRes.data) || 'INR');
+      } catch {
+        currencyCache.set(panelId, 'INR');
       }
     }
 
+    const fxCache = new Map();
+    async function toInr(amount, currency) {
+      if (!currency || currency === 'INR') return amount;
+      if (!fxCache.has(currency)) {
+        try {
+          const fx = await getInrExchangeRate(currency);
+          fxCache.set(currency, fx.rate);
+        } catch {
+          fxCache.set(currency, null);
+        }
+      }
+      const rate = fxCache.get(currency);
+      return rate == null ? null : amount * rate;
+    }
+
     const breakdown = {};
-    let nativeTotal = 0;
+    let total = 0;
     let missingRate = false;
 
     for (const label of SERVICE_LABELS) {
       const units = Math.max(0, Math.floor(Number(requested[label]) || 0));
       if (units <= 0) continue;
 
-      const serviceId = String(cfg.serviceIds?.[label] || '').trim();
-      if (!serviceId) continue;
+      const slots = usableSlots(cfg, label, panelsById);
+      if (slots.length === 0) continue;
 
-      const rate = rateById.get(serviceId);
-      if (!Number.isFinite(rate) || rate <= 0) { missingRate = true; continue; }
+      // Runs rotate evenly across slots, so split the volume evenly too.
+      const unitsPerSlot = units / slots.length;
+      let labelTotal = 0;
+      let pricedAny = false;
 
-      // Standard SMM panels quote a price per 1,000 units.
-      const native = (units / 1000) * rate;
-      nativeTotal += native;
-      breakdown[label] = Math.round(native * exchangeRateToInr * 100) / 100;
+      for (const slot of slots) {
+        await loadPanel(slot.panelId);
+        const rate = catalogueCache.get(slot.panelId)?.get(slot.serviceId);
+        if (!Number.isFinite(rate) || rate <= 0) { missingRate = true; continue; }
+
+        const native = (unitsPerSlot / 1000) * rate;
+        const inr = await toInr(native, currencyCache.get(slot.panelId));
+        if (inr == null) { missingRate = true; continue; }
+        labelTotal += inr;
+        pricedAny = true;
+      }
+
+      if (pricedAny) {
+        breakdown[label] = Math.round(labelTotal * 100) / 100;
+        total += labelTotal;
+      }
     }
 
-    if (missingRate && nativeTotal === 0) {
-      return res.json({ available: false, reason: 'Panel did not return usable rates.' });
+    if (Object.keys(breakdown).length === 0) {
+      return res.json({
+        available: false,
+        reason: missingRate
+          ? 'Panel did not return usable rates.'
+          : 'No priced services in this order.',
+      });
     }
 
     return res.json({
       available: true,
-      total: Math.round(nativeTotal * exchangeRateToInr * 100) / 100,
+      total: Math.round(total * 100) / 100,
       breakdown,
-      currency: currency || 'INR',
-      nativeTotal: Math.round(nativeTotal * 10000) / 10000,
-      exchangeRateToInr,
-      exchangeRateUpdatedAt: rateUpdatedAt,
+      currency: 'INR',
       partial: missingRate,
     });
   } catch (e) {
@@ -1392,7 +1552,7 @@ app.post('/api/quote', requireUser, async (req, res) => {
 app.get('/api/panel-config', async (_req, res) => {
   try {
     const doc = await getPanelConfig();
-    res.json(publicPanelConfig(doc));
+    res.json(await publicPanelConfig(doc));
   } catch (e) {
     err('GET /api/panel-config:', e?.message || e);
     res.status(500).json({ error: 'Could not load panel configuration' });
@@ -1404,53 +1564,139 @@ app.post('/api/admin/verify', requireAdmin, (_req, res) => {
   res.json({ success: true });
 });
 
-// ---- Admin: read config, including which service ids are set ----
+// ---- Admin: read panels + slot mapping ----
 app.get('/api/admin/panel-config', requireAdmin, async (_req, res) => {
   try {
     const doc = await getPanelConfig();
-    res.json(publicPanelConfig(doc));
+    res.json(await adminPanelConfig(doc));
   } catch (e) {
     err('GET /api/admin/panel-config:', e?.message || e);
     res.status(500).json({ error: 'Could not load panel configuration' });
   }
 });
 
-// ---- Admin: save panel + service ids ----
-app.post('/api/admin/panel-config', requireAdmin, async (req, res) => {
+/* ---- Admin: create a panel ---- */
+app.post('/api/admin/panels', requireAdmin, async (req, res) => {
   try {
-    const { panelName, apiUrl, apiKey, serviceIds } = req.body || {};
+    const name = String(req.body?.name || '').trim();
+    const apiUrl = String(req.body?.apiUrl || '').trim();
+    const apiKey = String(req.body?.apiKey || '').trim();
+
+    if (!name) return res.status(400).json({ error: 'Panel name is required' });
+    if (!validateProviderUrl(apiUrl)) {
+      return res.status(400).json({ error: 'API URL must be a valid http(s) URL' });
+    }
+    if (!apiKey) return res.status(400).json({ error: 'API key is required' });
+
+    const panel = await Panel.create({ name, apiUrl, apiKey });
+    log(`➕ Panel added: ${name}`);
+    const doc = await getPanelConfig();
+    res.status(201).json({ success: true, id: String(panel._id), ...(await adminPanelConfig(doc)) });
+  } catch (e) {
+    err('POST /api/admin/panels:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not add panel' });
+  }
+});
+
+/* ---- Admin: update a panel ---- */
+app.post('/api/admin/panels/:id', requireAdmin, async (req, res) => {
+  try {
+    const panel = await Panel.findById(req.params.id);
+    if (!panel) return res.status(404).json({ error: 'Panel not found' });
+
+    if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+      panel.name = req.body.name.trim();
+    }
+    if (typeof req.body?.apiUrl === 'string' && req.body.apiUrl.trim()) {
+      if (!validateProviderUrl(req.body.apiUrl)) {
+        return res.status(400).json({ error: 'API URL must be a valid http(s) URL' });
+      }
+      panel.apiUrl = req.body.apiUrl.trim();
+    }
+    // Blank key means "keep the stored one".
+    if (typeof req.body?.apiKey === 'string' && req.body.apiKey.trim()) {
+      panel.apiKey = req.body.apiKey.trim();
+    }
+    if (typeof req.body?.isActive === 'boolean') {
+      panel.isActive = req.body.isActive;
+    }
+
+    panel.updatedAt = new Date();
+    await panel.save();
+    const doc = await getPanelConfig();
+    res.json({ success: true, ...(await adminPanelConfig(doc)) });
+  } catch (e) {
+    err('POST /api/admin/panels/:id:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not update panel' });
+  }
+});
+
+/* ---- Admin: delete a panel (and any slots pointing at it) ---- */
+app.delete('/api/admin/panels/:id', requireAdmin, async (req, res) => {
+  try {
+    const panel = await Panel.findById(req.params.id);
+    if (!panel) return res.status(404).json({ error: 'Panel not found' });
+
+    await Panel.deleteOne({ _id: panel._id });
+
+    // Drop orphaned slots so the mapping can never reference a dead panel.
+    const doc = await getPanelConfig();
+    let removed = 0;
+    for (const label of SERVICE_LABELS) {
+      const before = (doc.serviceSlots[label] || []).length;
+      doc.serviceSlots[label] = (doc.serviceSlots[label] || [])
+        .filter(slot => String(slot.panelId) !== String(panel._id));
+      removed += before - doc.serviceSlots[label].length;
+    }
+    if (removed > 0) {
+      doc.updatedAt = new Date();
+      await doc.save();
+    }
+    log(`🗑️  Panel deleted: ${panel.name} (${removed} slot(s) removed)`);
+    res.json({ success: true, removedSlots: removed, ...(await adminPanelConfig(doc)) });
+  } catch (e) {
+    err('DELETE /api/admin/panels/:id:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not delete panel' });
+  }
+});
+
+/* ---- Admin: replace the slot list for one or more labels ----
+   Body: { serviceSlots: { views: [{panelId, serviceId}, ...], ... } } */
+app.post('/api/admin/service-slots', requireAdmin, async (req, res) => {
+  try {
+    const incoming = req.body?.serviceSlots;
+    if (!incoming || typeof incoming !== 'object') {
+      return res.status(400).json({ error: 'serviceSlots object is required' });
+    }
 
     const doc = await getPanelConfig();
+    const panelsById = await loadPanelsById();
 
-    if (typeof panelName === 'string') doc.panelName = panelName.trim();
+    for (const label of SERVICE_LABELS) {
+      if (!(label in incoming)) continue;
+      const rows = Array.isArray(incoming[label]) ? incoming[label] : [];
 
-    if (typeof apiUrl === 'string' && apiUrl.trim()) {
-      const valid = validateProviderUrl(apiUrl);
-      if (!valid) return res.status(400).json({ error: 'API URL must be a valid http(s) URL' });
-      doc.apiUrl = apiUrl.trim();
-    }
-
-    // Only overwrite the key when a new non-empty value is supplied, so the
-    // admin can edit service ids without re-typing the key every time.
-    if (typeof apiKey === 'string' && apiKey.trim()) {
-      doc.apiKey = apiKey.trim();
-    }
-
-    if (serviceIds && typeof serviceIds === 'object') {
-      for (const label of SERVICE_LABELS) {
-        if (label in serviceIds) {
-          doc.serviceIds[label] = String(serviceIds[label] ?? '').trim();
+      const cleaned = [];
+      for (const row of rows.slice(0, 10)) { // hard cap, keeps rotation sane
+        const panelId = String(row?.panelId || '').trim();
+        const serviceId = String(row?.serviceId || '').trim();
+        if (!panelId || !serviceId) continue;
+        if (!panelsById.has(panelId)) {
+          return res.status(400).json({ error: `Unknown panel for ${label}` });
         }
+        cleaned.push({ panelId, serviceId });
       }
+      doc.serviceSlots[label] = cleaned;
     }
 
+    doc.migratedToSlots = true;
     doc.updatedAt = new Date();
     await doc.save();
-    log(`⚙️  Panel config updated (${doc.panelName || doc.apiUrl})`);
-    res.json({ success: true, ...publicPanelConfig(doc) });
+    log('⚙️  Service slots updated');
+    res.json({ success: true, ...(await adminPanelConfig(doc)) });
   } catch (e) {
-    err('POST /api/admin/panel-config:', e?.message || e);
-    res.status(500).json({ error: e?.message || 'Could not save panel configuration' });
+    err('POST /api/admin/service-slots:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not save service slots' });
   }
 });
 
@@ -1500,10 +1746,18 @@ app.post('/api/admin/users/:id/active', requireAdmin, async (req, res) => {
 // ---- Admin: fetch the service catalogue using the STORED credentials ----
 app.post('/api/admin/services', requireAdmin, async (req, res) => {
   try {
-    const doc = await getPanelConfig();
-    // Allow testing an unsaved panel by passing overrides.
-    const apiUrl = String(req.body?.apiUrl || doc.apiUrl || '').trim();
-    const apiKey = String(req.body?.apiKey || doc.apiKey || '').trim();
+    // Either target a saved panel by id, or test unsaved credentials.
+    let apiUrl = String(req.body?.apiUrl || '').trim();
+    let apiKey = String(req.body?.apiKey || '').trim();
+
+    const panelId = String(req.body?.panelId || '').trim();
+    if (panelId) {
+      const panel = await Panel.findById(panelId).lean();
+      if (!panel) return res.status(404).json({ error: 'Panel not found' });
+      apiUrl = apiUrl || panel.apiUrl;
+      apiKey = apiKey || panel.apiKey;
+    }
+
     if (!apiUrl || !apiKey) {
       return res.status(400).json({ error: 'Panel URL and API key are required' });
     }
