@@ -64,6 +64,25 @@ const PROVIDER_HTTP_TIMEOUT_MS = 30_000;
 // Hard upper bound on runs claimed per tick (safety guard)
 const MAX_CLAIMS_PER_TICK = 50;
 
+/* ------------------------------------------------------------
+   KEEP-ALIVE (free-tier survival)
+   Render's free instance sleeps after ~15 minutes without HTTP
+   traffic, which stops the scheduler and makes scheduled runs
+   fire late. Pinging ourselves keeps the process resident.
+
+   Render exposes RENDER_EXTERNAL_URL automatically, so this
+   normally needs no configuration. Set KEEP_ALIVE_URL to
+   override, or KEEP_ALIVE=off to disable (e.g. on a paid plan
+   where it is unnecessary).
+   ------------------------------------------------------------ */
+const KEEP_ALIVE_URL =
+  process.env.KEEP_ALIVE === 'off'
+    ? ''
+    : (process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || '').trim();
+
+// Comfortably under Render's ~15 minute idle timeout.
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000;
+
 /* ============================================================
    LOGGING
    ============================================================ */
@@ -1111,10 +1130,46 @@ async function start() {
   setInterval(schedulerTick, TICK_INTERVAL_MS);
   log(`🚀 Scheduler running every ${TICK_INTERVAL_MS / 1000}s`);
 
+  /* Keep the free instance awake. Without this the process sleeps after
+     ~15 min idle and scheduled runs stop firing until someone visits. */
+  if (KEEP_ALIVE_URL) {
+    const target = `${KEEP_ALIVE_URL.replace(/\/$/, '')}/api/health`;
+    log(`💓 Keep-alive pinging ${target} every ${KEEP_ALIVE_INTERVAL_MS / 60000} min`);
+    setInterval(async () => {
+      try {
+        const res = await fetch(target, { signal: AbortSignal.timeout(20_000) });
+        if (!res.ok) warn(`Keep-alive ping returned HTTP ${res.status}`);
+      } catch (e) {
+        // A failed ping is not fatal; the next one may succeed.
+        warn('Keep-alive ping failed:', e?.message || e);
+      }
+    }, KEEP_ALIVE_INTERVAL_MS);
+  } else {
+    warn('Keep-alive is OFF. On Render free tier the scheduler will stop when the instance sleeps.');
+  }
+
+  /* Warn loudly when delivery is drifting, so the logs show the problem
+     rather than it being silent. */
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const oldest = await Run.findOne(
+        { status: 'pending', time: { $lte: new Date(now - 10 * 60 * 1000) } },
+        { time: 1 }
+      ).sort({ time: 1 }).lean();
+      if (oldest) {
+        const lateMin = Math.round((now - new Date(oldest.time)) / 60000);
+        const overdue = await Run.countDocuments({ status: 'pending', time: { $lte: now } });
+        warn(`⏰ Delivery lag: ${overdue} run(s) overdue, oldest ${lateMin} min late.`);
+      }
+    } catch { /* monitoring must never crash the process */ }
+  }, 5 * 60 * 1000);
+
   app.listen(PORT, '0.0.0.0', () => {
     log(`========================================`);
     log(`Server listening on port ${PORT}`);
     log(`MIN_VIEWS_PER_RUN = ${MIN_VIEWS_PER_RUN}`);
+    log(`Keep-alive: ${KEEP_ALIVE_URL ? 'ON' : 'OFF'}`);
     log(`========================================`);
   });
 }
@@ -2404,11 +2459,34 @@ app.get('/', (_req, res) => {
 
 // ---- Health ----
 app.get('/api/health', async (_req, res) => {
+  // How far behind is the scheduler? On a sleeping free instance this is the
+  // number that tells you delivery is drifting.
+  let overdue = 0;
+  let oldestOverdueMinutes = 0;
+  try {
+    const now = new Date();
+    overdue = await Run.countDocuments({ status: 'pending', time: { $lte: now } });
+    if (overdue > 0) {
+      const oldest = await Run.findOne(
+        { status: 'pending', time: { $lte: now } },
+        { time: 1 }
+      ).sort({ time: 1 }).lean();
+      if (oldest) {
+        oldestOverdueMinutes = Math.round((now - new Date(oldest.time)) / 60000);
+      }
+    }
+  } catch { /* health must never throw */ }
+
   res.json({
     status: 'ok',
     mongoConnected: mongoose.connection.readyState === 1,
     uptime: process.uptime(),
     inFlightTuples: inFlight.size,
     minViewsPerRun: MIN_VIEWS_PER_RUN,
+    // Delivery lag indicators
+    overdueRuns: overdue,
+    oldestOverdueMinutes,
+    schedulerHealthy: oldestOverdueMinutes < 10,
+    keepAlive: KEEP_ALIVE_URL ? 'on' : 'off',
   });
 });
