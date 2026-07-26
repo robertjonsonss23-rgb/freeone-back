@@ -163,6 +163,9 @@ const UserSchema = new mongoose.Schema({
   isActive:     { type: Boolean, default: true },
   // Reserved so email verification can be switched on later without a migration.
   isVerified:   { type: Boolean, default: false },
+  /* Owner accounts are yours: they can top up their own wallet without a
+     deposit, and they see the markup (your commission) on each order. */
+  isOwner:      { type: Boolean, default: false },
   /* Wallet balance in paise (integer) — never floats, so repeated
      debits can't drift. ₹50.00 is stored as 5000. */
   balancePaise: { type: Number, default: 0, min: 0 },
@@ -360,6 +363,7 @@ function publicUser(user) {
     email: user.email,
     name: user.name || '',
     balance: Math.round(Number(user.balancePaise) || 0) / 100,
+    isOwner: user.isOwner === true,
     createdAt: user.createdAt,
   };
 }
@@ -1857,11 +1861,16 @@ async function computeQuote(requestedUnits) {
   }
 
   const totalPaise = Object.values(breakdown).reduce((sum, v) => sum + v, 0);
+  const markupPercent = Number(settings.markupPercent) || 0;
+  // What the panel charges us, before markup. Used to show your commission.
+  const costPaise = Math.round((costInr || 0) * 100);
   return {
     available: true,
     totalPaise,
     breakdownPaise: breakdown,
-    markupPercent: Number(settings.markupPercent) || 0,
+    markupPercent,
+    costPaise,
+    profitPaise: Math.max(0, totalPaise - costPaise),
     partial: missingRate,
   };
 }
@@ -1882,7 +1891,7 @@ app.post('/api/quote', requireUser, async (req, res) => {
       breakdown[label] = toRupees(paise);
     }
 
-    return res.json({
+    const payload = {
       available: true,
       total: toRupees(quote.totalPaise),
       breakdown,
@@ -1890,7 +1899,19 @@ app.post('/api/quote', requireUser, async (req, res) => {
       partial: quote.partial,
       balance: toRupees(req.user.balancePaise),
       sufficient: req.user.balancePaise >= quote.totalPaise,
-    });
+    };
+
+    /* Owner accounts see the economics: panel cost, your markup, and the
+       resulting commission in rupees. Never sent to normal users. */
+    if (req.user.isOwner === true) {
+      payload.owner = {
+        panelCost: toRupees(quote.costPaise),
+        commission: toRupees(quote.profitPaise),
+        markupPercent: quote.markupPercent,
+      };
+    }
+
+    return res.json(payload);
   } catch (e) {
     err('POST /api/quote:', e?.message || e);
     return res.status(500).json({ error: e?.message || 'Could not calculate price' });
@@ -1950,6 +1971,40 @@ app.get('/api/wallet', requireUser, async (req, res) => {
   } catch (e) {
     err('GET /api/wallet:', e?.message || e);
     res.status(500).json({ error: 'Could not load wallet' });
+  }
+});
+
+/* ---- Owner self top-up ----
+   Owner accounts are yours, so they can credit their own wallet without a
+   real payment. Guarded by isOwner, which only the admin panel can set. */
+app.post('/api/wallet/self-topup', requireUser, async (req, res) => {
+  try {
+    if (req.user.isOwner !== true) {
+      return res.status(403).json({ error: 'Not permitted on this account' });
+    }
+    const amountPaise = toPaise(req.body?.amount);
+    if (!Number.isFinite(amountPaise) || amountPaise === 0) {
+      return res.status(400).json({ error: 'Enter a non-zero amount' });
+    }
+
+    if (amountPaise > 0) {
+      const balance = await creditWallet(req.user._id, amountPaise, {
+        type: 'admin_credit',
+        note: 'Owner self top-up',
+      });
+      log(`\uD83D\uDC51 Owner top-up +\u20B9${toRupees(amountPaise)} (${req.user.email})`);
+      return res.json({ success: true, balance: toRupees(balance) });
+    }
+
+    const result = await debitWallet(req.user._id, Math.abs(amountPaise), {
+      type: 'admin_debit',
+      note: 'Owner self adjustment',
+    });
+    if (!result.ok) return res.status(400).json({ error: 'Balance is too low' });
+    res.json({ success: true, balance: toRupees(result.balance) });
+  } catch (e) {
+    err('POST /api/wallet/self-topup:', e?.message || e);
+    res.status(500).json({ error: 'Could not adjust wallet' });
   }
 });
 
@@ -2379,6 +2434,7 @@ app.get('/api/admin/users', requireAdmin, async (_req, res) => {
         email: u.email,
         name: u.name || '',
         isActive: u.isActive !== false,
+        isOwner: u.isOwner === true,
         balance: toRupees(u.balancePaise),
         createdAt: u.createdAt,
         lastLoginAt: u.lastLoginAt,
@@ -2388,6 +2444,59 @@ app.get('/api/admin/users', requireAdmin, async (_req, res) => {
   } catch (e) {
     err('GET /api/admin/users:', e?.message || e);
     res.status(500).json({ error: 'Could not load users' });
+  }
+});
+
+/* ---- Admin: create an owner account ----
+   Creates a normal login that can self-fund and see commission figures. */
+app.post('/api/admin/users/owner', requireAdmin, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    const name = String(req.body?.name || '').trim();
+
+    if (!EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const existing = await User.findOne({ email });
+    if (existing) {
+      // Promote an existing account rather than failing.
+      existing.isOwner = true;
+      await existing.save();
+      log(`\uD83D\uDC51 Existing account promoted to owner: ${email}`);
+      return res.json({ success: true, promoted: true, id: String(existing._id) });
+    }
+
+    const salt = makeSalt();
+    const user = await User.create({
+      email, salt, passwordHash: hashPassword(password, salt),
+      name, isOwner: true,
+    });
+    log(`\uD83D\uDC51 Owner account created: ${email}`);
+    res.status(201).json({ success: true, id: String(user._id) });
+  } catch (e) {
+    if (e?.code === 11000) return res.status(409).json({ error: 'Email already exists' });
+    err('POST /api/admin/users/owner:', e?.message || e);
+    res.status(500).json({ error: 'Could not create owner account' });
+  }
+});
+
+/* ---- Admin: toggle owner status on an existing account ---- */
+app.post('/api/admin/users/:id/owner', requireAdmin, async (req, res) => {
+  try {
+    const isOwner = Boolean(req.body?.isOwner);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.isOwner = isOwner;
+    await user.save();
+    res.json({ success: true, id: String(user._id), isOwner });
+  } catch (e) {
+    err('POST /api/admin/users/:id/owner:', e?.message || e);
+    res.status(500).json({ error: 'Could not update user' });
   }
 });
 
