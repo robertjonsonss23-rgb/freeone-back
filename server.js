@@ -166,6 +166,12 @@ const UserSchema = new mongoose.Schema({
   /* Owner accounts are yours: they can top up their own wallet without a
      deposit, and they see the markup (your commission) on each order. */
   isOwner:      { type: Boolean, default: false },
+  /* One-time paywall for the New Order page. Once true it stays true —
+     the unlock is for life. Owners bypass the check entirely. */
+  hasOrderAccess:   { type: Boolean, default: false },
+  orderAccessAt:    { type: Date, default: null },
+  /* How the unlock happened: 'payment' (approved purchase) or 'admin'. */
+  orderAccessSource:{ type: String, default: '' },
   /* Wallet balance in paise (integer) — never floats, so repeated
      debits can't drift. ₹50.00 is stored as 5000. */
   balancePaise: { type: Number, default: 0, min: 0 },
@@ -189,11 +195,15 @@ const TransactionSchema = new mongoose.Schema({
   createdAt:    { type: Date, default: Date.now, index: true },
 });
 
-/* A user-submitted top-up awaiting admin approval. */
+/* A user-submitted payment awaiting admin approval.
+   `purpose` decides what approval does:
+     'wallet' → credit the wallet (the original behaviour)
+     'access' → unlock the New Order page for life (paywall) */
 const DepositSchema = new mongoose.Schema({
   userId:      { type: String, required: true, index: true },
   userEmail:   { type: String, default: '' },
   amountPaise: { type: Number, required: true },
+  purpose:     { type: String, enum: ['wallet', 'access'], default: 'wallet', index: true },
   method:      { type: String, enum: ['upi', 'crypto'], required: true },
   methodId:    { type: String, default: '' },        // which UPI id / wallet was used
   reference:   { type: String, required: true },      // UTR or tx hash
@@ -216,6 +226,13 @@ const PaymentSettingsSchema = new mongoose.Schema({
   markupPercent:    { type: Number, default: 30 },
   upiEnabled:       { type: Boolean, default: true },
   cryptoEnabled:    { type: Boolean, default: false },
+  /* ---- New Order paywall (admin switch) ----
+     When OFF nobody is gated, no matter what hasOrderAccess says, so the
+     admin can turn it off at any moment and every user is let straight in. */
+  paywallEnabled:   { type: Boolean, default: false },
+  paywallPricePaise:{ type: Number, default: 49900 },   // ₹499
+  paywallTitle:     { type: String, default: 'Unlock New Order' },
+  paywallBlurb:     { type: String, default: 'One-time payment. Unlocks the New Order page on this account for life.' },
   upiMethods: [{
     _id:         false,
     id:          { type: String, required: true },
@@ -364,6 +381,7 @@ function publicUser(user) {
     name: user.name || '',
     balance: Math.round(Number(user.balancePaise) || 0) / 100,
     isOwner: user.isOwner === true,
+    hasOrderAccess: user.hasOrderAccess === true,
     createdAt: user.createdAt,
   };
 }
@@ -548,7 +566,70 @@ function publicPaymentSettings(doc) {
         address: m.address, instructions: m.instructions,
         qrImage: m.qrImage || '',
       })),
+    paywall: {
+      enabled: Boolean(doc.paywallEnabled),
+      price: toRupees(doc.paywallPricePaise),
+      title: doc.paywallTitle || 'Unlock New Order',
+      blurb: doc.paywallBlurb || '',
+    },
   };
+}
+
+/* ============================================================
+   NEW ORDER PAYWALL
+   A single admin switch gates the New Order page. Three ways in:
+     1. the switch is off        → everybody is allowed
+     2. the account is an owner  → always allowed (it's yours)
+     3. hasOrderAccess is true   → they paid once, allowed for life
+   ============================================================ */
+
+/** True when this user may use the New Order page right now. */
+function userCanOrder(user, settings) {
+  if (!settings || settings.paywallEnabled !== true) return true;
+  if (!user) return false;
+  if (user.isOwner === true) return true;
+  return user.hasOrderAccess === true;
+}
+
+/** The paywall block returned to a signed-in user. */
+function orderAccessPayload(user, settings) {
+  const enabled = Boolean(settings?.paywallEnabled);
+  return {
+    paywallEnabled: enabled,
+    // Reflects the reason, so the UI can say "included with your owner account".
+    allowed: userCanOrder(user, settings),
+    unlocked: user?.hasOrderAccess === true,
+    isOwner: user?.isOwner === true,
+    price: toRupees(settings?.paywallPricePaise),
+    title: settings?.paywallTitle || 'Unlock New Order',
+    blurb: settings?.paywallBlurb || '',
+    unlockedAt: user?.orderAccessAt || null,
+  };
+}
+
+/** Flip a user's lifetime access on. Idempotent. */
+async function grantOrderAccess(userId, source) {
+  const user = await User.findByIdAndUpdate(
+    userId,
+    { $set: { hasOrderAccess: true, orderAccessAt: new Date(), orderAccessSource: source } },
+    { new: true }
+  );
+  return user;
+}
+
+/** Route guard for anything that creates or changes an order. */
+async function requireOrderAccess(req, res, next) {
+  try {
+    const settings = await getPaymentSettings();
+    if (userCanOrder(req.user, settings)) return next();
+    return res.status(402).json({
+      error: 'Your account has not unlocked the New Order page yet.',
+      paywall: orderAccessPayload(req.user, settings),
+    });
+  } catch (e) {
+    err('requireOrderAccess:', e?.message || e);
+    res.status(500).json({ error: 'Access check failed' });
+  }
 }
 
 /** Read the singleton panel config, creating an empty one on first call. */
@@ -1194,7 +1275,7 @@ process.on('SIGTERM', async () => {
    ============================================================ */
 
 // ---- Create order ----
-app.post('/api/order', requireUser, async (req, res) => {
+app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
   try {
     const { link, services, name } = req.body || {};
     if (!link || !services) {
@@ -1699,8 +1780,17 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ---- Who am I (used to restore a session on page load) ----
-app.get('/api/auth/me', requireUser, (req, res) => {
-  res.json({ user: publicUser(req.user) });
+app.get('/api/auth/me', requireUser, async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    res.json({
+      user: publicUser(req.user),
+      orderAccess: orderAccessPayload(req.user, settings),
+    });
+  } catch (e) {
+    // The identity still matters even if settings can't be read.
+    res.json({ user: publicUser(req.user) });
+  }
 });
 
 // ---- Log out (invalidate this session only) ----
@@ -1933,6 +2023,165 @@ app.get('/api/payment-methods', async (_req, res) => {
   }
 });
 
+/* ============================================================
+   NEW ORDER PAYWALL ROUTES
+   ============================================================ */
+
+/* ---- Where the user stands, plus what they'd have to pay ----
+   The payment methods are the SAME list the wallet deposit screen uses,
+   so the admin only ever configures UPI / crypto in one place. */
+app.get('/api/order-access', requireUser, async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    const pending = await Deposit.findOne({
+      userId: String(req.user._id),
+      purpose: 'access',
+      status: 'pending',
+    }).sort({ createdAt: -1 }).lean();
+
+    res.json({
+      ...orderAccessPayload(req.user, settings),
+      balance: toRupees(req.user.balancePaise),
+      payment: publicPaymentSettings(settings),
+      pending: pending
+        ? {
+            id: String(pending._id),
+            amount: toRupees(pending.amountPaise),
+            method: pending.method,
+            reference: pending.reference,
+            createdAt: pending.createdAt,
+          }
+        : null,
+    });
+  } catch (e) {
+    err('GET /api/order-access:', e?.message || e);
+    res.status(500).json({ error: 'Could not load access status' });
+  }
+});
+
+/* ---- Submit a paywall payment for approval ----
+   Mirrors /api/wallet/deposit, but approving it unlocks the page instead
+   of crediting the wallet. */
+app.post('/api/order-access/purchase', requireUser, async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+
+    if (settings.paywallEnabled !== true) {
+      return res.status(400).json({ error: 'The New Order page is currently open to everyone.' });
+    }
+    if (userCanOrder(req.user, settings)) {
+      return res.status(409).json({ error: 'This account already has access.' });
+    }
+
+    const method = String(req.body?.method || '').toLowerCase();
+    const reference = String(req.body?.reference || '').trim();
+    const methodId = String(req.body?.methodId || '').trim();
+
+    if (method !== 'upi' && method !== 'crypto') {
+      return res.status(400).json({ error: 'Choose a valid payment method' });
+    }
+    if (method === 'upi' && !settings.upiEnabled) {
+      return res.status(400).json({ error: 'UPI payments are currently disabled' });
+    }
+    if (method === 'crypto' && !settings.cryptoEnabled) {
+      return res.status(400).json({ error: 'Crypto payments are currently disabled' });
+    }
+    if (reference.length < 6) {
+      return res.status(400).json({
+        error: method === 'upi'
+          ? 'Enter the 12-digit UTR / reference number from your payment app'
+          : 'Enter the transaction hash',
+      });
+    }
+
+    // One open request at a time, so the queue can't be flooded.
+    const open = await Deposit.findOne({
+      userId: String(req.user._id), purpose: 'access', status: 'pending',
+    });
+    if (open) {
+      return res.status(409).json({
+        error: 'You already have an unlock request waiting for approval.',
+      });
+    }
+
+    // Same UTR re-use guard as wallet deposits.
+    const duplicate = await Deposit.findOne({ reference });
+    if (duplicate) {
+      return res.status(409).json({ error: 'This reference number has already been submitted' });
+    }
+
+    // The price is taken from settings, never from the request body.
+    const deposit = await Deposit.create({
+      userId: String(req.user._id),
+      userEmail: req.user.email,
+      amountPaise: settings.paywallPricePaise,
+      purpose: 'access',
+      method, methodId, reference,
+    });
+
+    log(`🔓 Unlock request ₹${toRupees(deposit.amountPaise)} from ${req.user.email} (${reference})`);
+    res.status(201).json({
+      success: true,
+      request: {
+        id: String(deposit._id),
+        amount: toRupees(deposit.amountPaise),
+        status: deposit.status,
+        createdAt: deposit.createdAt,
+      },
+      message: 'Submitted. Your access is unlocked once the payment is verified.',
+    });
+  } catch (e) {
+    if (e?.code === 11000) {
+      return res.status(409).json({ error: 'This reference number has already been submitted' });
+    }
+    err('POST /api/order-access/purchase:', e?.message || e);
+    res.status(500).json({ error: 'Could not submit unlock request' });
+  }
+});
+
+/* ---- Unlock instantly using existing wallet balance ----
+   No admin approval needed: the money is already verified. */
+app.post('/api/order-access/pay-from-wallet', requireUser, async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+
+    if (settings.paywallEnabled !== true) {
+      return res.status(400).json({ error: 'The New Order page is currently open to everyone.' });
+    }
+    if (userCanOrder(req.user, settings)) {
+      return res.status(409).json({ error: 'This account already has access.' });
+    }
+
+    const price = Math.round(Number(settings.paywallPricePaise) || 0);
+    if (price <= 0) {
+      // A free paywall is just an unlock.
+      const user = await grantOrderAccess(req.user._id, 'admin');
+      return res.json({ success: true, balance: toRupees(user.balancePaise), unlocked: true });
+    }
+
+    const debit = await debitWallet(req.user._id, price, {
+      type: 'order_debit',
+      note: 'New Order page — lifetime unlock',
+      reference: 'order-access',
+    });
+    if (!debit.ok) {
+      return res.status(402).json({
+        error: 'Wallet balance is too low',
+        required: toRupees(price),
+        balance: toRupees(req.user.balancePaise),
+        shortfall: toRupees(price - req.user.balancePaise),
+      });
+    }
+
+    const user = await grantOrderAccess(req.user._id, 'payment');
+    log(`🔓 Access unlocked from wallet: ${req.user.email} (₹${toRupees(price)})`);
+    res.json({ success: true, unlocked: true, balance: toRupees(user.balancePaise) });
+  } catch (e) {
+    err('POST /api/order-access/pay-from-wallet:', e?.message || e);
+    res.status(500).json({ error: 'Could not unlock access' });
+  }
+});
+
 // ---- Wallet balance + recent ledger ----
 app.get('/api/wallet', requireUser, async (req, res) => {
   try {
@@ -2082,16 +2331,28 @@ app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
   try {
     const status = String(req.query?.status || 'pending');
     const filter = status === 'all' ? {} : { status };
+    // 'wallet' | 'access' | 'all' — lets the admin UI show two queues.
+    const purpose = String(req.query?.purpose || 'all');
+    if (purpose === 'wallet') {
+      // Rows written before the paywall existed have no `purpose` field.
+      filter.$or = [{ purpose: 'wallet' }, { purpose: { $exists: false } }];
+    } else if (purpose === 'access') {
+      filter.purpose = 'access';
+    }
+
     const deposits = await Deposit.find(filter).sort({ createdAt: -1 }).limit(200).lean();
     const pendingCount = await Deposit.countDocuments({ status: 'pending' });
+    const pendingAccessCount = await Deposit.countDocuments({ status: 'pending', purpose: 'access' });
 
     res.json({
       pendingCount,
+      pendingAccessCount,
       deposits: deposits.map(d => ({
         id: String(d._id),
         userId: d.userId,
         userEmail: d.userEmail,
         amount: toRupees(d.amountPaise),
+        purpose: d.purpose || 'wallet',
         method: d.method,
         methodId: d.methodId,
         reference: d.reference,
@@ -2134,8 +2395,16 @@ app.post('/api/admin/deposits/:id/review', requireAdmin, async (req, res) => {
       return res.status(409).json({ error: 'Deposit not found or already reviewed' });
     }
 
+    const purpose = deposit.purpose || 'wallet';
     let balance = null;
-    if (action === 'approve') {
+    let unlocked = false;
+
+    if (action === 'approve' && purpose === 'access') {
+      // Paywall payment: unlock the page instead of crediting the wallet.
+      await grantOrderAccess(deposit.userId, 'payment');
+      unlocked = true;
+      log(`🔓 Access approved: ₹${toRupees(deposit.amountPaise)} → ${deposit.userEmail}`);
+    } else if (action === 'approve') {
       balance = await creditWallet(deposit.userId, deposit.amountPaise, {
         type: 'deposit',
         note: `${deposit.method.toUpperCase()} deposit — ${deposit.reference}`,
@@ -2143,12 +2412,14 @@ app.post('/api/admin/deposits/:id/review', requireAdmin, async (req, res) => {
       });
       log(`✅ Deposit approved: ₹${toRupees(deposit.amountPaise)} → ${deposit.userEmail}`);
     } else {
-      log(`❌ Deposit rejected: ${deposit.reference} (${deposit.userEmail})`);
+      log(`❌ ${purpose === 'access' ? 'Unlock' : 'Deposit'} rejected: ${deposit.reference} (${deposit.userEmail})`);
     }
 
     res.json({
       success: true,
       status: deposit.status,
+      purpose,
+      unlocked,
       newBalance: balance == null ? null : toRupees(balance),
     });
   } catch (e) {
@@ -2195,6 +2466,10 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
       cryptoEnabled: doc.cryptoEnabled,
       upiMethods: doc.upiMethods || [],
       cryptoMethods: doc.cryptoMethods || [],
+      paywallEnabled: Boolean(doc.paywallEnabled),
+      paywallPrice: toRupees(doc.paywallPricePaise),
+      paywallTitle: doc.paywallTitle || 'Unlock New Order',
+      paywallBlurb: doc.paywallBlurb || '',
       updatedAt: doc.updatedAt,
     });
   } catch (e) {
@@ -2224,6 +2499,22 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     }
     if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
+
+    /* ---- Paywall switch ---- */
+    if (typeof body.paywallEnabled === 'boolean') doc.paywallEnabled = body.paywallEnabled;
+    if (body.paywallPrice !== undefined) {
+      const paise = toPaise(body.paywallPrice);
+      if (!Number.isFinite(paise) || paise < 0) {
+        return res.status(400).json({ error: 'Unlock price cannot be negative' });
+      }
+      doc.paywallPricePaise = paise;
+    }
+    if (body.paywallTitle !== undefined) {
+      doc.paywallTitle = String(body.paywallTitle).trim().slice(0, 80) || 'Unlock New Order';
+    }
+    if (body.paywallBlurb !== undefined) {
+      doc.paywallBlurb = String(body.paywallBlurb).trim().slice(0, 400);
+    }
 
     if (Array.isArray(body.upiMethods)) {
       const existing = new Map((doc.upiMethods || []).map(m => [m.id, m]));
@@ -2435,6 +2726,8 @@ app.get('/api/admin/users', requireAdmin, async (_req, res) => {
         name: u.name || '',
         isActive: u.isActive !== false,
         isOwner: u.isOwner === true,
+        hasOrderAccess: u.hasOrderAccess === true,
+        orderAccessAt: u.orderAccessAt || null,
         balance: toRupees(u.balancePaise),
         createdAt: u.createdAt,
         lastLoginAt: u.lastLoginAt,
@@ -2497,6 +2790,27 @@ app.post('/api/admin/users/:id/owner', requireAdmin, async (req, res) => {
   } catch (e) {
     err('POST /api/admin/users/:id/owner:', e?.message || e);
     res.status(500).json({ error: 'Could not update user' });
+  }
+});
+
+/* ---- Admin: grant or revoke New Order access by hand ----
+   Useful for comping a friend, or undoing a mistaken approval. */
+app.post('/api/admin/users/:id/order-access', requireAdmin, async (req, res) => {
+  try {
+    const grant = Boolean(req.body?.hasOrderAccess);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    user.hasOrderAccess = grant;
+    user.orderAccessAt = grant ? new Date() : null;
+    user.orderAccessSource = grant ? 'admin' : '';
+    await user.save();
+
+    log(`${grant ? '🔓' : '🔒'} Order access ${grant ? 'granted to' : 'revoked from'} ${user.email}`);
+    res.json({ success: true, id: String(user._id), hasOrderAccess: grant });
+  } catch (e) {
+    err('POST /api/admin/users/:id/order-access:', e?.message || e);
+    res.status(500).json({ error: 'Could not update access' });
   }
 });
 
