@@ -207,6 +207,11 @@ const DepositSchema = new mongoose.Schema({
   method:      { type: String, enum: ['upi', 'crypto'], required: true },
   methodId:    { type: String, default: '' },        // which UPI id / wallet was used
   reference:   { type: String, required: true },      // UTR or tx hash
+  /* For crypto payments: exactly what the user was told to send, captured at
+     submission time so the admin verifies against the quoted figure even if
+     the price is edited afterwards. */
+  cryptoMicros:{ type: Number, default: 0 },
+  cryptoCoin:  { type: String, default: '' },
   status: {
     type: String,
     enum: ['pending', 'approved', 'rejected'],
@@ -252,6 +257,24 @@ const PaymentSettingsSchema = new mongoose.Schema({
     address:     { type: String, default: '' },
     instructions:{ type: String, default: '' },
     qrImage:     { type: String, default: '' },
+    isActive:    { type: Boolean, default: true },
+    /* Ticker shown next to every crypto amount, e.g. "USDT". */
+    coin:        { type: String, default: 'USDT' },
+  }],
+  /* ---- Crypto pricing (no exchange rate; the admin types every figure) ----
+     Amounts are integer micro-units (1 USDT = 1_000_000) so repeated maths
+     can never drift the way a float would. */
+  paywallCryptoMicros: { type: Number, default: 0 },   // 0 = crypto unlock not offered
+  /* Top-up packs. A user buying with crypto picks one of these instead of
+     typing a rupee amount, because without a rate there is nothing to
+     convert an arbitrary amount into. */
+  cryptoPacks: [{
+    _id:         false,
+    id:          { type: String, required: true },
+    // What the wallet is credited, in paise.
+    amountPaise: { type: Number, required: true },
+    // What they must send, in micro-units of `coin`.
+    cryptoMicros:{ type: Number, required: true },
     isActive:    { type: Boolean, default: true },
   }],
   updatedAt:        { type: Date, default: Date.now },
@@ -473,6 +496,21 @@ function toRupees(paise) {
   return Math.round(Number(paise || 0)) / 100;
 }
 
+/* Crypto amounts use 6 decimal places (the USDT standard) held as integers,
+   so 5.67 USDT is stored as 5_670_000 and never suffers float drift. */
+const CRYPTO_SCALE = 1_000_000;
+function toMicros(amount) {
+  return Math.round(Number(amount || 0) * CRYPTO_SCALE);
+}
+function fromMicros(micros) {
+  return Math.round(Number(micros) || 0) / CRYPTO_SCALE;
+}
+/** Trim trailing zeros: 5.670000 -> "5.67", 6.000000 -> "6". */
+function formatCrypto(micros) {
+  const value = fromMicros(micros);
+  return String(Number(value.toFixed(6)));
+}
+
 async function getPaymentSettings() {
   let doc = await PaymentSettings.findOne({ key: 'default' });
   if (!doc) doc = await PaymentSettings.create({ key: 'default' });
@@ -565,10 +603,23 @@ function publicPaymentSettings(doc) {
         id: m.id, label: m.label, network: m.network,
         address: m.address, instructions: m.instructions,
         qrImage: m.qrImage || '',
+        coin: m.coin || 'USDT',
+      })),
+    /* Fixed top-up packs for crypto buyers. Sorted cheapest first so the
+       list reads naturally. */
+    cryptoPacks: (doc.cryptoPacks || [])
+      .filter(p => p.isActive && p.amountPaise > 0 && p.cryptoMicros > 0)
+      .sort((a, b) => a.amountPaise - b.amountPaise)
+      .map(p => ({
+        id: p.id,
+        amount: toRupees(p.amountPaise),
+        crypto: formatCrypto(p.cryptoMicros),
       })),
     paywall: {
       enabled: Boolean(doc.paywallEnabled),
       price: toRupees(doc.paywallPricePaise),
+      // "" when the admin hasn't priced the unlock in crypto yet.
+      cryptoPrice: doc.paywallCryptoMicros > 0 ? formatCrypto(doc.paywallCryptoMicros) : '',
       title: doc.paywallTitle || 'Unlock New Order',
       blurb: doc.paywallBlurb || '',
     },
@@ -601,6 +652,8 @@ function orderAccessPayload(user, settings) {
     unlocked: user?.hasOrderAccess === true,
     isOwner: user?.isOwner === true,
     price: toRupees(settings?.paywallPricePaise),
+    // "" when the admin hasn't set a crypto price — the UI then hides crypto.
+    cryptoPrice: settings?.paywallCryptoMicros > 0 ? formatCrypto(settings.paywallCryptoMicros) : '',
     title: settings?.paywallTitle || 'Unlock New Order',
     blurb: settings?.paywallBlurb || '',
     unlockedAt: user?.orderAccessAt || null,
@@ -2047,6 +2100,8 @@ app.get('/api/order-access', requireUser, async (req, res) => {
         ? {
             id: String(pending._id),
             amount: toRupees(pending.amountPaise),
+            crypto: pending.cryptoMicros > 0 ? formatCrypto(pending.cryptoMicros) : '',
+            coin: pending.cryptoCoin || '',
             method: pending.method,
             reference: pending.reference,
             createdAt: pending.createdAt,
@@ -2086,6 +2141,13 @@ app.post('/api/order-access/purchase', requireUser, async (req, res) => {
     if (method === 'crypto' && !settings.cryptoEnabled) {
       return res.status(400).json({ error: 'Crypto payments are currently disabled' });
     }
+    /* Without a crypto price there is no amount to ask for, so refuse rather
+       than let someone "pay" an unstated sum. */
+    if (method === 'crypto' && !(settings.paywallCryptoMicros > 0)) {
+      return res.status(400).json({
+        error: 'Crypto is not available for this unlock yet. Please pay by UPI or contact the administrator.',
+      });
+    }
     if (reference.length < 6) {
       return res.status(400).json({
         error: method === 'upi'
@@ -2110,21 +2172,32 @@ app.post('/api/order-access/purchase', requireUser, async (req, res) => {
       return res.status(409).json({ error: 'This reference number has already been submitted' });
     }
 
-    // The price is taken from settings, never from the request body.
+    // Both prices are taken from settings, never from the request body.
+    const chosenCoin = method === 'crypto'
+      ? ((settings.cryptoMethods || []).find(m => m.id === methodId)?.coin || 'USDT')
+      : '';
+
     const deposit = await Deposit.create({
       userId: String(req.user._id),
       userEmail: req.user.email,
       amountPaise: settings.paywallPricePaise,
       purpose: 'access',
       method, methodId, reference,
+      cryptoMicros: method === 'crypto' ? settings.paywallCryptoMicros : 0,
+      cryptoCoin: chosenCoin,
     });
 
-    log(`🔓 Unlock request ₹${toRupees(deposit.amountPaise)} from ${req.user.email} (${reference})`);
+    const shown = method === 'crypto'
+      ? `${formatCrypto(deposit.cryptoMicros)} ${chosenCoin}`
+      : `₹${toRupees(deposit.amountPaise)}`;
+    log(`🔓 Unlock request ${shown} from ${req.user.email} (${reference})`);
     res.status(201).json({
       success: true,
       request: {
         id: String(deposit._id),
         amount: toRupees(deposit.amountPaise),
+        crypto: method === 'crypto' ? formatCrypto(deposit.cryptoMicros) : '',
+        coin: chosenCoin,
         status: deposit.status,
         createdAt: deposit.createdAt,
       },
@@ -2209,6 +2282,8 @@ app.get('/api/wallet', requireUser, async (req, res) => {
       deposits: deposits.map(d => ({
         id: String(d._id),
         amount: toRupees(d.amountPaise),
+        crypto: d.cryptoMicros > 0 ? formatCrypto(d.cryptoMicros) : '',
+        coin: d.cryptoCoin || '',
         method: d.method,
         reference: d.reference,
         status: d.status,
@@ -2261,10 +2336,10 @@ app.post('/api/wallet/self-topup', requireUser, async (req, res) => {
 app.post('/api/wallet/deposit', requireUser, async (req, res) => {
   try {
     const settings = await getPaymentSettings();
-    const amountPaise = toPaise(req.body?.amount);
     const method = String(req.body?.method || '').toLowerCase();
     const reference = String(req.body?.reference || '').trim();
     const methodId = String(req.body?.methodId || '').trim();
+    const packId = String(req.body?.packId || '').trim();
 
     if (method !== 'upi' && method !== 'crypto') {
       return res.status(400).json({ error: 'Choose a valid payment method' });
@@ -2275,11 +2350,40 @@ app.post('/api/wallet/deposit', requireUser, async (req, res) => {
     if (method === 'crypto' && !settings.cryptoEnabled) {
       return res.status(400).json({ error: 'Crypto payments are currently disabled' });
     }
-    if (!Number.isFinite(amountPaise) || amountPaise < settings.minDepositPaise) {
-      return res.status(400).json({
-        error: `Minimum deposit is ₹${toRupees(settings.minDepositPaise)}`,
-      });
+
+    /* ---- How much is this worth? ----
+       UPI: the user types a rupee amount, because they can send any amount.
+       Crypto: there is no exchange rate, so they must pick one of the admin's
+       fixed packs and BOTH figures come from that pack, never from the body. */
+    let amountPaise;
+    let cryptoMicros = 0;
+    let cryptoCoin = '';
+
+    if (method === 'crypto') {
+      const packs = (settings.cryptoPacks || []).filter(
+        p => p.isActive && p.amountPaise > 0 && p.cryptoMicros > 0
+      );
+      if (packs.length === 0) {
+        return res.status(400).json({
+          error: 'No crypto top-up amounts are set up yet. Please use UPI or contact the administrator.',
+        });
+      }
+      const pack = packs.find(p => p.id === packId);
+      if (!pack) {
+        return res.status(400).json({ error: 'Choose one of the available crypto amounts' });
+      }
+      amountPaise = pack.amountPaise;
+      cryptoMicros = pack.cryptoMicros;
+      cryptoCoin = (settings.cryptoMethods || []).find(m => m.id === methodId)?.coin || 'USDT';
+    } else {
+      amountPaise = toPaise(req.body?.amount);
+      if (!Number.isFinite(amountPaise) || amountPaise < settings.minDepositPaise) {
+        return res.status(400).json({
+          error: `Minimum deposit is ₹${toRupees(settings.minDepositPaise)}`,
+        });
+      }
     }
+
     if (reference.length < 6) {
       return res.status(400).json({
         error: method === 'upi'
@@ -2304,14 +2408,21 @@ app.post('/api/wallet/deposit', requireUser, async (req, res) => {
       method,
       methodId,
       reference,
+      cryptoMicros,
+      cryptoCoin,
     });
 
-    log(`💰 Deposit request ₹${toRupees(amountPaise)} from ${req.user.email} (${reference})`);
+    const shown = method === 'crypto'
+      ? `${formatCrypto(cryptoMicros)} ${cryptoCoin} (₹${toRupees(amountPaise)})`
+      : `₹${toRupees(amountPaise)}`;
+    log(`💰 Deposit request ${shown} from ${req.user.email} (${reference})`);
     res.status(201).json({
       success: true,
       deposit: {
         id: String(deposit._id),
         amount: toRupees(deposit.amountPaise),
+        crypto: method === 'crypto' ? formatCrypto(cryptoMicros) : '',
+        coin: cryptoCoin,
         status: deposit.status,
         createdAt: deposit.createdAt,
       },
@@ -2352,6 +2463,8 @@ app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
         userId: d.userId,
         userEmail: d.userEmail,
         amount: toRupees(d.amountPaise),
+        crypto: d.cryptoMicros > 0 ? formatCrypto(d.cryptoMicros) : '',
+        coin: d.cryptoCoin || '',
         purpose: d.purpose || 'wallet',
         method: d.method,
         methodId: d.methodId,
@@ -2465,9 +2578,20 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
       upiEnabled: doc.upiEnabled,
       cryptoEnabled: doc.cryptoEnabled,
       upiMethods: doc.upiMethods || [],
-      cryptoMethods: doc.cryptoMethods || [],
+      cryptoMethods: (doc.cryptoMethods || []).map(m => ({
+        id: m.id, label: m.label, network: m.network, address: m.address,
+        instructions: m.instructions, qrImage: m.qrImage || '',
+        isActive: m.isActive !== false, coin: m.coin || 'USDT',
+      })),
+      cryptoPacks: (doc.cryptoPacks || []).map(p => ({
+        id: p.id,
+        amount: toRupees(p.amountPaise),
+        crypto: formatCrypto(p.cryptoMicros),
+        isActive: p.isActive !== false,
+      })),
       paywallEnabled: Boolean(doc.paywallEnabled),
       paywallPrice: toRupees(doc.paywallPricePaise),
+      paywallCryptoPrice: doc.paywallCryptoMicros > 0 ? formatCrypto(doc.paywallCryptoMicros) : '',
       paywallTitle: doc.paywallTitle || 'Unlock New Order',
       paywallBlurb: doc.paywallBlurb || '',
       updatedAt: doc.updatedAt,
@@ -2543,8 +2667,38 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
           instructions: String(m?.instructions || '').trim(),
           qrImage: sanitizeQrImage(m?.qrImage, existing.get(id)?.qrImage || ''),
           isActive: m?.isActive !== false,
+          coin: (String(m?.coin || 'USDT').trim().toUpperCase().slice(0, 10)) || 'USDT',
         };
       });
+    }
+
+    /* ---- Crypto top-up packs ----
+       Each row pairs a rupee credit with the exact crypto amount to send.
+       Rows missing either half are dropped rather than saved half-priced. */
+    if (Array.isArray(body.cryptoPacks)) {
+      doc.cryptoPacks = body.cryptoPacks
+        .slice(0, 12)
+        .map((p, i) => ({
+          id: String(p?.id || `pack-${Date.now()}-${i}`),
+          amountPaise: toPaise(p?.amount),
+          cryptoMicros: toMicros(p?.crypto),
+          isActive: p?.isActive !== false,
+        }))
+        .filter(p => p.amountPaise > 0 && p.cryptoMicros > 0);
+    }
+
+    /* ---- Paywall price in crypto (blank / 0 = don't offer crypto) ---- */
+    if (body.paywallCryptoPrice !== undefined) {
+      const raw = String(body.paywallCryptoPrice).trim();
+      if (raw === '') {
+        doc.paywallCryptoMicros = 0;
+      } else {
+        const micros = toMicros(raw);
+        if (!Number.isFinite(micros) || micros < 0) {
+          return res.status(400).json({ error: 'Crypto unlock price cannot be negative' });
+        }
+        doc.paywallCryptoMicros = micros;
+      }
     }
 
     doc.updatedAt = new Date();
