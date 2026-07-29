@@ -91,6 +91,61 @@ function warn(...args) { console.warn(new Date().toISOString(), '⚠️', ...arg
 function err(...args)  { console.error(new Date().toISOString(), '❌', ...args); }
 
 /* ============================================================
+   TELEGRAM ALERTS
+   Pings your phone the moment money needs your attention, so you
+   don't have to sit refreshing the admin panel.
+
+   Setup: message @BotFather -> /newbot -> copy the token into
+   TELEGRAM_BOT_TOKEN. Then message your own bot once, open
+   https://api.telegram.org/bot<TOKEN>/getUpdates and copy the
+   chat id into TELEGRAM_CHAT_ID. Unset either one and alerts are
+   silently skipped — the app behaves exactly as before.
+   ============================================================ */
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID   = (process.env.TELEGRAM_CHAT_ID || '').trim();
+const TELEGRAM_ENABLED   = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+// Overridable so the test suite can point at a local stub instead of Telegram.
+const TELEGRAM_API_BASE  = (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/$/, '');
+
+if (!TELEGRAM_ENABLED) {
+  log('ℹ️  Telegram alerts are off (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable).');
+}
+
+/** Telegram's HTML mode chokes on raw angle brackets and ampersands. */
+function tgEscape(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/* Fire-and-forget: a dead bot token or a Telegram outage must never
+   break a payment, so every failure is swallowed after a warning. */
+async function notifyTelegram(text) {
+  if (!TELEGRAM_ENABLED) return false;
+  try {
+    const response = await axios.post(
+      `${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      },
+      { timeout: 8000, validateStatus: () => true }
+    );
+    if (response.status !== 200 || response.data?.ok !== true) {
+      warn('Telegram alert rejected:', response.data?.description || `HTTP ${response.status}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    warn('Telegram alert failed:', e?.message || e);
+    return false;
+  }
+}
+
+/* ============================================================
    SCHEMAS
    ============================================================ */
 const RunSchema = new mongoose.Schema({
@@ -175,6 +230,15 @@ const UserSchema = new mongoose.Schema({
   /* Wallet balance in paise (integer) — never floats, so repeated
      debits can't drift. ₹50.00 is stored as 5000. */
   balancePaise: { type: Number, default: 0, min: 0 },
+  /* ---- Referrals ----
+     Every account gets a short shareable code. `referredBy` records who
+     invited them; the reward only pays out once their first deposit is
+     approved, so fake signups earn nothing. */
+  referralCode:     { type: String, index: true, sparse: true, unique: true },
+  referredBy:       { type: String, default: '', index: true },  // referrer's userId
+  referralRewarded: { type: Boolean, default: false },           // has this referral paid out?
+  referralCount:    { type: Number, default: 0 },                // successful invites made
+  referralEarnedPaise: { type: Number, default: 0 },
   createdAt:    { type: Date, default: Date.now },
   lastLoginAt:  { type: Date, default: null },
 });
@@ -185,7 +249,7 @@ const TransactionSchema = new mongoose.Schema({
   userId:       { type: String, required: true, index: true },
   type: {
     type: String,
-    enum: ['deposit', 'order_debit', 'refund', 'admin_credit', 'admin_debit'],
+    enum: ['deposit', 'order_debit', 'refund', 'admin_credit', 'admin_debit', 'referral'],
     required: true,
   },
   amountPaise:  { type: Number, required: true },   // positive = credit
@@ -236,6 +300,15 @@ const PaymentSettingsSchema = new mongoose.Schema({
      admin can turn it off at any moment and every user is let straight in. */
   paywallEnabled:   { type: Boolean, default: false },
   paywallPricePaise:{ type: Number, default: 49900 },   // ₹499
+  /* ---- Referral programme ----
+     Both sides get a flat reward, paid when the invited user's first
+     deposit is approved. */
+  referralEnabled:      { type: Boolean, default: false },
+  referrerRewardPaise:  { type: Number, default: 5000 },   // ₹50 to the inviter
+  refereeRewardPaise:   { type: Number, default: 5000 },   // ₹50 to the friend
+  /* Guard against paying out on a token deposit: the friend must put in
+     at least this much before any reward is released. */
+  referralMinDepositPaise: { type: Number, default: 10000 }, // ₹100
   paywallTitle:     { type: String, default: 'Unlock New Order' },
   paywallBlurb:     { type: String, default: 'One-time payment. Unlocks the New Order page on this account for life.' },
   upiMethods: [{
@@ -624,6 +697,112 @@ function publicPaymentSettings(doc) {
       blurb: doc.paywallBlurb || '',
     },
   };
+}
+
+/* ============================================================
+   REFERRALS
+   Reward is released only when the invited user's FIRST deposit is
+   approved, so creating throwaway accounts earns nothing.
+   ============================================================ */
+
+/* Unambiguous alphabet: no O/0, I/1, so codes survive being read aloud
+   or copied off a screenshot. */
+const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function makeReferralCode(length = 6) {
+  let out = '';
+  const bytes = crypto.randomBytes(length);
+  for (let i = 0; i < length; i++) out += REF_ALPHABET[bytes[i] % REF_ALPHABET.length];
+  return out;
+}
+
+function normalizeReferralCode(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/** Give a user a unique code, retrying on the (unlikely) collision. */
+async function ensureReferralCode(user) {
+  if (user.referralCode) return user.referralCode;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const code = makeReferralCode();
+    const clash = await User.findOne({ referralCode: code }).lean();
+    if (clash) continue;
+    user.referralCode = code;
+    try {
+      await user.save();
+      return code;
+    } catch (e) {
+      if (e?.code !== 11000) throw e;   // duplicate key: loop and try again
+    }
+  }
+  // Fall back to a longer code rather than leaving the user without one.
+  const fallback = makeReferralCode(10);
+  user.referralCode = fallback;
+  await user.save();
+  return fallback;
+}
+
+/* Pay out a referral, if this deposit qualifies.
+   Called after a deposit is approved. Safe to call repeatedly: the
+   `referralRewarded` flag is flipped with an atomic guarded update, so
+   two concurrent approvals can never both pay. */
+async function maybePayReferral(userId, depositPaise) {
+  try {
+    const settings = await getPaymentSettings();
+    if (settings.referralEnabled !== true) return null;
+
+    const referee = await User.findById(userId);
+    if (!referee) return null;
+    if (!referee.referredBy) return null;            // nobody invited them
+    if (referee.referralRewarded) return null;       // already paid
+    if (depositPaise < settings.referralMinDepositPaise) return null;
+
+    const referrer = await User.findById(referee.referredBy);
+    if (!referrer || referrer.isActive === false) return null;
+
+    /* Claim the payout atomically. Whoever flips false->true wins; any
+       parallel call sees matchedCount 0 and stops. */
+    const claim = await User.updateOne(
+      { _id: referee._id, referralRewarded: { $ne: true } },
+      { $set: { referralRewarded: true } }
+    );
+    if (claim.matchedCount === 0 || claim.modifiedCount === 0) return null;
+
+    const refereeReward = Math.max(0, Math.round(settings.refereeRewardPaise));
+    const referrerReward = Math.max(0, Math.round(settings.referrerRewardPaise));
+
+    if (refereeReward > 0) {
+      await creditWallet(referee._id, refereeReward, {
+        type: 'referral',
+        note: 'Referral bonus — welcome!',
+        reference: String(referrer._id),
+      });
+    }
+    if (referrerReward > 0) {
+      await creditWallet(referrer._id, referrerReward, {
+        type: 'referral',
+        note: `Referral bonus — ${referee.email} joined`,
+        reference: String(referee._id),
+      });
+    }
+
+    await User.updateOne(
+      { _id: referrer._id },
+      { $inc: { referralCount: 1, referralEarnedPaise: referrerReward } }
+    );
+
+    log(`🎁 Referral paid: ${referrer.email} +₹${toRupees(referrerReward)}, ${referee.email} +₹${toRupees(refereeReward)}`);
+    notifyTelegram(
+      `🎁 <b>Referral reward paid</b>\n\n` +
+      `Inviter: ${tgEscape(referrer.email)} +₹${toRupees(referrerReward)}\n` +
+      `Friend: ${tgEscape(referee.email)} +₹${toRupees(refereeReward)}`
+    );
+    return { referrerReward, refereeReward };
+  } catch (e) {
+    // A referral must never break the deposit that triggered it.
+    err('maybePayReferral:', e?.message || e);
+    return null;
+  }
 }
 
 /* ============================================================
@@ -1778,17 +1957,29 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
 
+    /* Resolve the referral code before creating the account. An unknown or
+       self-referring code is ignored rather than blocking the signup —
+       never lose a registration over a typo'd code. */
+    let referredBy = '';
+    const code = normalizeReferralCode(req.body?.referralCode);
+    if (code) {
+      const referrer = await User.findOne({ referralCode: code }).lean();
+      if (referrer && referrer.isActive !== false) referredBy = String(referrer._id);
+    }
+
     const salt = makeSalt();
     const user = await User.create({
       email,
       salt,
       passwordHash: hashPassword(password, salt),
       name,
+      referredBy,
+      referralCode: makeReferralCode(),
       lastLoginAt: new Date(),
     });
 
     const token = await createSession(user._id);
-    log(`👤 New account: ${email}`);
+    log(`👤 New account: ${email}${referredBy ? ` (referred by ${code})` : ''}`);
     return res.status(201).json({ success: true, token, user: publicUser(user) });
   } catch (e) {
     // Unique index can still fire under a race; report it cleanly.
@@ -2077,6 +2268,75 @@ app.get('/api/payment-methods', async (_req, res) => {
 });
 
 /* ============================================================
+   REFERRAL ROUTES
+   ============================================================ */
+
+/* ---- The signed-in user's referral dashboard ---- */
+app.get('/api/referral', requireUser, async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    // Accounts created before referrals existed have no code yet.
+    const code = await ensureReferralCode(req.user);
+
+    const invited = await User.find({ referredBy: String(req.user._id) })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    res.json({
+      enabled: settings.referralEnabled === true,
+      code,
+      referrerReward: toRupees(settings.referrerRewardPaise),
+      refereeReward: toRupees(settings.refereeRewardPaise),
+      minDeposit: toRupees(settings.referralMinDepositPaise),
+      totalInvited: invited.length,
+      totalRewarded: invited.filter(u => u.referralRewarded).length,
+      earned: toRupees(req.user.referralEarnedPaise),
+      // Emails are partly masked: the inviter doesn't need the full address.
+      invites: invited.map(u => {
+        const [name = '', domain = ''] = String(u.email || '').split('@');
+        const shown = name.length <= 2 ? `${name}***` : `${name.slice(0, 2)}***`;
+        return {
+          email: `${shown}@${domain}`,
+          joinedAt: u.createdAt,
+          rewarded: u.referralRewarded === true,
+        };
+      }),
+    });
+  } catch (e) {
+    err('GET /api/referral:', e?.message || e);
+    res.status(500).json({ error: 'Could not load your referral details' });
+  }
+});
+
+/* ---- Public: is this code real? ----
+   Lets the signup form confirm a code before the account is created.
+   Returns only a boolean and a first name — never an email. */
+app.get('/api/referral/check/:code', async (req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    if (settings.referralEnabled !== true) {
+      return res.json({ valid: false, enabled: false });
+    }
+    const code = normalizeReferralCode(req.params.code);
+    if (!code) return res.json({ valid: false, enabled: true });
+
+    const referrer = await User.findOne({ referralCode: code }).lean();
+    const valid = Boolean(referrer && referrer.isActive !== false);
+    res.json({
+      valid,
+      enabled: true,
+      invitedBy: valid ? (referrer.name || '').split(' ')[0] || '' : '',
+      refereeReward: toRupees(settings.refereeRewardPaise),
+      minDeposit: toRupees(settings.referralMinDepositPaise),
+    });
+  } catch (e) {
+    err('GET /api/referral/check:', e?.message || e);
+    res.status(500).json({ error: 'Could not check that code' });
+  }
+});
+
+/* ============================================================
    NEW ORDER PAYWALL ROUTES
    ============================================================ */
 
@@ -2191,6 +2451,15 @@ app.post('/api/order-access/purchase', requireUser, async (req, res) => {
       ? `${formatCrypto(deposit.cryptoMicros)} ${chosenCoin}`
       : `₹${toRupees(deposit.amountPaise)}`;
     log(`🔓 Unlock request ${shown} from ${req.user.email} (${reference})`);
+    // Not awaited: the user's response must not wait on Telegram.
+    notifyTelegram(
+      `🔓 <b>New Order unlock request</b>\n\n` +
+      `Amount: <b>${tgEscape(shown)}</b>\n` +
+      `From: ${tgEscape(req.user.email)}\n` +
+      `Method: ${tgEscape(method.toUpperCase())}\n` +
+      `${method === 'upi' ? 'UTR' : 'TX'}: <code>${tgEscape(reference)}</code>\n\n` +
+      `Check the money arrived, then approve in the admin panel.`
+    );
     res.status(201).json({
       success: true,
       request: {
@@ -2416,6 +2685,14 @@ app.post('/api/wallet/deposit', requireUser, async (req, res) => {
       ? `${formatCrypto(cryptoMicros)} ${cryptoCoin} (₹${toRupees(amountPaise)})`
       : `₹${toRupees(amountPaise)}`;
     log(`💰 Deposit request ${shown} from ${req.user.email} (${reference})`);
+    notifyTelegram(
+      `💰 <b>New wallet deposit</b>\n\n` +
+      `Amount: <b>${tgEscape(shown)}</b>\n` +
+      `From: ${tgEscape(req.user.email)}\n` +
+      `Method: ${tgEscape(method.toUpperCase())}\n` +
+      `${method === 'upi' ? 'UTR' : 'TX'}: <code>${tgEscape(reference)}</code>\n\n` +
+      `Check the money arrived, then approve in the admin panel.`
+    );
     res.status(201).json({
       success: true,
       deposit: {
@@ -2511,6 +2788,7 @@ app.post('/api/admin/deposits/:id/review', requireAdmin, async (req, res) => {
     const purpose = deposit.purpose || 'wallet';
     let balance = null;
     let unlocked = false;
+    let referral = null;
 
     if (action === 'approve' && purpose === 'access') {
       // Paywall payment: unlock the page instead of crediting the wallet.
@@ -2524,6 +2802,9 @@ app.post('/api/admin/deposits/:id/review', requireAdmin, async (req, res) => {
         reference: String(deposit._id),
       });
       log(`✅ Deposit approved: ₹${toRupees(deposit.amountPaise)} → ${deposit.userEmail}`);
+      // A first approved deposit is what releases any referral reward.
+      referral = await maybePayReferral(deposit.userId, deposit.amountPaise);
+      if (referral) balance = (await User.findById(deposit.userId).lean())?.balancePaise ?? balance;
     } else {
       log(`❌ ${purpose === 'access' ? 'Unlock' : 'Deposit'} rejected: ${deposit.reference} (${deposit.userEmail})`);
     }
@@ -2534,6 +2815,12 @@ app.post('/api/admin/deposits/:id/review', requireAdmin, async (req, res) => {
       purpose,
       unlocked,
       newBalance: balance == null ? null : toRupees(balance),
+      referralPaid: referral
+        ? {
+            referrer: toRupees(referral.referrerReward),
+            referee: toRupees(referral.refereeReward),
+          }
+        : null,
     });
   } catch (e) {
     err('POST /api/admin/deposits/:id/review:', e?.message || e);
@@ -2589,6 +2876,10 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
         crypto: formatCrypto(p.cryptoMicros),
         isActive: p.isActive !== false,
       })),
+      referralEnabled: Boolean(doc.referralEnabled),
+      referrerReward: toRupees(doc.referrerRewardPaise),
+      refereeReward: toRupees(doc.refereeRewardPaise),
+      referralMinDeposit: toRupees(doc.referralMinDepositPaise),
       paywallEnabled: Boolean(doc.paywallEnabled),
       paywallPrice: toRupees(doc.paywallPricePaise),
       paywallCryptoPrice: doc.paywallCryptoMicros > 0 ? formatCrypto(doc.paywallCryptoMicros) : '',
@@ -2623,6 +2914,21 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     }
     if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
+
+    /* ---- Referral programme ---- */
+    if (typeof body.referralEnabled === 'boolean') doc.referralEnabled = body.referralEnabled;
+    for (const [key, field] of [
+      ['referrerReward', 'referrerRewardPaise'],
+      ['refereeReward', 'refereeRewardPaise'],
+      ['referralMinDeposit', 'referralMinDepositPaise'],
+    ]) {
+      if (body[key] === undefined) continue;
+      const paise = toPaise(body[key]);
+      if (!Number.isFinite(paise) || paise < 0) {
+        return res.status(400).json({ error: 'Referral amounts cannot be negative' });
+      }
+      doc[field] = paise;
+    }
 
     /* ---- Paywall switch ---- */
     if (typeof body.paywallEnabled === 'boolean') doc.paywallEnabled = body.paywallEnabled;
@@ -2865,6 +3171,28 @@ app.post('/api/admin/service-slots', requireAdmin, async (req, res) => {
 });
 
 // ---- Admin: list registered users ----
+/* ---- Admin: send a test Telegram alert ----
+   Lets you confirm the bot token and chat id actually work without
+   having to make a real payment. */
+app.post('/api/admin/telegram/test', requireAdmin, async (_req, res) => {
+  if (!TELEGRAM_ENABLED) {
+    return res.status(400).json({
+      error: 'Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Render, then redeploy.',
+      configured: false,
+    });
+  }
+  const ok = await notifyTelegram(
+    '✅ <b>TRUESMM test alert</b>\n\nIf you can read this, deposit alerts are working.'
+  );
+  if (!ok) {
+    return res.status(502).json({
+      error: 'Telegram rejected the message. Double-check the bot token and chat id.',
+      configured: true,
+    });
+  }
+  res.json({ success: true, configured: true });
+});
+
 app.get('/api/admin/users', requireAdmin, async (_req, res) => {
   try {
     const users = await User.find().sort({ createdAt: -1 }).limit(500).lean();
@@ -2881,6 +3209,8 @@ app.get('/api/admin/users', requireAdmin, async (_req, res) => {
         isActive: u.isActive !== false,
         isOwner: u.isOwner === true,
         hasOrderAccess: u.hasOrderAccess === true,
+        referralCode: u.referralCode || '',
+        referralCount: u.referralCount || 0,
         orderAccessAt: u.orderAccessAt || null,
         balance: toRupees(u.balancePaise),
         createdAt: u.createdAt,
@@ -3063,6 +3393,7 @@ app.get('/api/health', async (_req, res) => {
     // Delivery lag indicators
     overdueRuns: overdue,
     oldestOverdueMinutes,
+    telegram: TELEGRAM_ENABLED ? 'on' : 'off',
     schedulerHealthy: oldestOverdueMinutes < 10,
     keepAlive: KEEP_ALIVE_URL ? 'on' : 'off',
   });
