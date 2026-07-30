@@ -436,7 +436,11 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 /* ============================================================
    SETTINGS (loaded from DB at boot)
    ============================================================ */
-let MIN_VIEWS_PER_RUN = 100;
+/* Providers reject tiny drip-feeds, and a run under 100 views looks
+   unnatural on the target platform. 100 is both the default and a hard
+   floor — the UI can raise it, never lower it. */
+const MIN_VIEWS_FLOOR = 100;
+let MIN_VIEWS_PER_RUN = MIN_VIEWS_FLOOR;
 
 /* ============================================================
    USER AUTH (email + password)
@@ -1075,8 +1079,14 @@ async function loadSettings() {
   try {
     const setting = await Settings.findOne({ key: 'minViewsPerRun' }).lean();
     if (setting && typeof setting.value === 'number' && setting.value >= 1) {
-      MIN_VIEWS_PER_RUN = setting.value;
-      log(`✅ Loaded MIN_VIEWS_PER_RUN from DB: ${MIN_VIEWS_PER_RUN}`);
+      // Clamp on read so a legacy value like 10 is corrected automatically.
+      MIN_VIEWS_PER_RUN = Math.max(MIN_VIEWS_FLOOR, Math.floor(setting.value));
+      if (MIN_VIEWS_PER_RUN !== setting.value) {
+        await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
+        log(`✅ Raised stored MIN_VIEWS_PER_RUN ${setting.value} → ${MIN_VIEWS_PER_RUN} (floor)`);
+      } else {
+        log(`✅ Loaded MIN_VIEWS_PER_RUN from DB: ${MIN_VIEWS_PER_RUN}`);
+      }
     } else {
       await Settings.findOneAndUpdate(
         { key: 'minViewsPerRun' },
@@ -1992,18 +2002,24 @@ app.get('/api/order/runs/:schedulerOrderId', requireUser, async (req, res) => {
 
 // ---- Min-views setting ----
 app.get('/api/settings/min-views', (_req, res) => {
-  res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN });
+  res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN, minimum: MIN_VIEWS_FLOOR });
 });
 
 app.post('/api/settings/min-views', async (req, res) => {
   const { minViewsPerRun } = req.body || {};
-  if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 1) {
+  if (typeof minViewsPerRun !== 'number' || !Number.isFinite(minViewsPerRun)) {
     return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
+  }
+  if (minViewsPerRun < MIN_VIEWS_FLOOR) {
+    return res.status(400).json({
+      error: `Minimum views per run cannot be below ${MIN_VIEWS_FLOOR}`,
+      minimum: MIN_VIEWS_FLOOR,
+    });
   }
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
   await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
   log(`MIN_VIEWS_PER_RUN updated → ${MIN_VIEWS_PER_RUN}`);
-  res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN });
+  res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN, minimum: MIN_VIEWS_FLOOR });
 });
 
 // ---- Queue / system status ----
