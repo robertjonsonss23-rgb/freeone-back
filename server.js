@@ -2274,6 +2274,113 @@ app.post('/api/auth/change-password', requireUser, async (req, res) => {
 /* Compute the price of a set of service volumes.
    Returns paise, including the admin's markup. Shared by /api/quote and
    /api/order so a user is always charged exactly what they were shown. */
+/* ============================================================
+   PANEL CATALOGUE CACHE
+   Pricing needs each panel's rate list. Fetching it on every quote meant
+   6 panels x 2 calls = 12 round trips per keystroke-debounce, ~3s per
+   quote, and no sharing between users. Rates change rarely, so they are
+   cached process-wide for a few minutes.
+
+   Two properties matter:
+     - in-flight de-duplication: ten users pricing at once trigger ONE
+       fetch per panel, not ten
+     - stale-on-failure: if a panel is down we keep serving the last known
+       rates rather than pricing the order at zero
+   ============================================================ */
+const PANEL_CATALOGUE_TTL_MS = 5 * 60 * 1000;
+// How soon to retry a panel that just failed, while still serving its
+// last-known rates in the meantime.
+const PANEL_STALE_RETRY_MS = 30 * 1000;
+const panelCatalogueCache = new Map();   // panelId -> { rates, currency, fetchedAt }
+const panelCatalogueInflight = new Map(); // panelId -> Promise
+
+/* Force the next quote to refetch this panel. The entry is expired rather
+   than deleted, so if that refetch fails we can still fall back to the last
+   known-good rates instead of pricing the order at zero. */
+function invalidatePanelCatalogue(panelId) {
+  const expire = (entry) => { if (entry) entry.fetchedAt = 0; };
+  if (panelId) {
+    expire(panelCatalogueCache.get(String(panelId)));
+    panelCatalogueInflight.delete(String(panelId));
+  } else {
+    for (const entry of panelCatalogueCache.values()) expire(entry);
+    panelCatalogueInflight.clear();
+  }
+}
+
+async function fetchPanelCatalogue(panel) {
+  const rates = new Map();
+  let ok = false;
+  try {
+    const params = new URLSearchParams({ key: panel.apiKey, action: 'services' });
+    const response = await axios.post(panel.apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: PROVIDER_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+    const data = response.data;
+    const list = Array.isArray(data) ? data
+      : Array.isArray(data?.services) ? data.services
+      : Array.isArray(data?.data) ? data.data
+      : [];
+    for (const row of list) {
+      const id = String(row?.service ?? row?.id ?? '').trim();
+      const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
+        .replace(/[^\d.]/g, ''));
+      if (id && Number.isFinite(rate)) rates.set(id, rate);
+    }
+    ok = rates.size > 0;
+  } catch (e) {
+    warn(`Quote: catalogue fetch failed for ${panel.name}:`, e?.message || e);
+  }
+
+  let currency = 'INR';
+  try {
+    const balanceParams = new URLSearchParams({ key: panel.apiKey, action: 'balance' });
+    const balanceRes = await axios.post(panel.apiUrl, balanceParams.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: PROVIDER_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+    currency = extractPanelCurrency(balanceRes.data) || 'INR';
+  } catch { /* default to INR */ }
+
+  return { rates, currency, ok };
+}
+
+/** Cached rate list + account currency for one panel. */
+async function getPanelCatalogue(panel) {
+  const id = String(panel._id);
+  const cached = panelCatalogueCache.get(id);
+  if (cached && Date.now() - cached.fetchedAt < PANEL_CATALOGUE_TTL_MS) return cached;
+
+  // Someone else is already fetching this panel — wait for their result.
+  const pending = panelCatalogueInflight.get(id);
+  if (pending) return pending;
+
+  const promise = (async () => {
+    try {
+      const fresh = await fetchPanelCatalogue(panel);
+      if (!fresh.ok && cached && cached.rates.size > 0) {
+        /* The panel failed. Serving the previous rates is far safer than
+           pricing at zero. Back off for a short while so a dead panel is
+           not retried on every single keystroke. */
+        warn(`Quote: using stale cached rates for ${panel.name}`);
+        cached.fetchedAt = Date.now() - PANEL_CATALOGUE_TTL_MS + PANEL_STALE_RETRY_MS;
+        return cached;
+      }
+      const entry = { rates: fresh.rates, currency: fresh.currency, fetchedAt: Date.now() };
+      panelCatalogueCache.set(id, entry);
+      return entry;
+    } finally {
+      panelCatalogueInflight.delete(id);
+    }
+  })();
+
+  panelCatalogueInflight.set(id, promise);
+  return promise;
+}
+
 async function computeQuote(requestedUnits) {
   const cfg = await getPanelConfig();
   const panelsById = await loadPanelsById();
@@ -2283,46 +2390,15 @@ async function computeQuote(requestedUnits) {
   const catalogueCache = new Map();
   const currencyCache = new Map();
 
+  /** Pull this panel's rates into the per-request maps, via the shared cache. */
   async function loadPanel(panelId) {
     if (catalogueCache.has(panelId)) return;
     const panel = panelsById.get(panelId);
     if (!panel) { catalogueCache.set(panelId, new Map()); return; }
 
-    const rates = new Map();
-    try {
-      const params = new URLSearchParams({ key: panel.apiKey, action: 'services' });
-      const response = await axios.post(panel.apiUrl, params.toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: PROVIDER_HTTP_TIMEOUT_MS,
-        validateStatus: () => true,
-      });
-      const data = response.data;
-      const list = Array.isArray(data) ? data
-        : Array.isArray(data?.services) ? data.services
-        : Array.isArray(data?.data) ? data.data
-        : [];
-      for (const row of list) {
-        const id = String(row?.service ?? row?.id ?? '').trim();
-        const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
-          .replace(/[^\d.]/g, ''));
-        if (id && Number.isFinite(rate)) rates.set(id, rate);
-      }
-    } catch (e) {
-      warn(`Quote: catalogue fetch failed for ${panel.name}:`, e?.message || e);
-    }
-    catalogueCache.set(panelId, rates);
-
-    try {
-      const balanceParams = new URLSearchParams({ key: panel.apiKey, action: 'balance' });
-      const balanceRes = await axios.post(panel.apiUrl, balanceParams.toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: PROVIDER_HTTP_TIMEOUT_MS,
-        validateStatus: () => true,
-      });
-      currencyCache.set(panelId, extractPanelCurrency(balanceRes.data) || 'INR');
-    } catch {
-      currencyCache.set(panelId, 'INR');
-    }
+    const entry = await getPanelCatalogue(panel);
+    catalogueCache.set(panelId, entry.rates);
+    currencyCache.set(panelId, entry.currency);
   }
 
   const fxCache = new Map();
@@ -3430,6 +3506,8 @@ app.post('/api/admin/panels/:id', requireAdmin, async (req, res) => {
 
     panel.updatedAt = new Date();
     await panel.save();
+    // Credentials or URL may have changed: drop the cached rate list.
+    invalidatePanelCatalogue(panel._id);
     const doc = await getPanelConfig();
     res.json({ success: true, ...(await adminPanelConfig(doc)) });
   } catch (e) {
@@ -3445,6 +3523,7 @@ app.delete('/api/admin/panels/:id', requireAdmin, async (req, res) => {
     if (!panel) return res.status(404).json({ error: 'Panel not found' });
 
     await Panel.deleteOne({ _id: panel._id });
+    invalidatePanelCatalogue(panel._id);
 
     // Drop orphaned slots so the mapping can never reference a dead panel.
     const doc = await getPanelConfig();
