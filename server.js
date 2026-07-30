@@ -1007,7 +1007,11 @@ async function loadPanelsById() {
 }
 
 /** Public view: service ids and panel names, never an API key. */
-async function publicPanelConfig(doc) {
+/* What the New Order page needs to know: which services are available, and
+   nothing else. Provider names and service ids are commercially sensitive —
+   they tell a customer exactly where to buy the same thing cheaper — so they
+   are only included for owner accounts. */
+async function publicPanelConfig(doc, { includeProviders = false } = {}) {
   const panelsById = await loadPanelsById();
   const services = {};
   for (const label of SERVICE_LABELS) {
@@ -1016,16 +1020,24 @@ async function publicPanelConfig(doc) {
       enabled: slots.length > 0,
       count: slots.length,
       rotating: slots.length > 1,
-      slots: slots.map(s => ({
-        serviceId: s.serviceId,
-        panelId: s.panelId,
-        panelName: panelsById.get(s.panelId)?.name || 'Unknown panel',
-      })),
+      ...(includeProviders
+        ? {
+            slots: slots.map(s => ({
+              serviceId: s.serviceId,
+              panelId: s.panelId,
+              panelName: panelsById.get(s.panelId)?.name || 'Unknown panel',
+            })),
+          }
+        : {}),
     };
   }
   const activePanels = [...panelsById.values()].filter(p => p.isActive !== false);
   return {
-    panels: activePanels.map(p => ({ id: String(p._id), name: p.name })),
+    // Normal users get a count only; owners get the real list.
+    panels: includeProviders
+      ? activePanels.map(p => ({ id: String(p._id), name: p.name }))
+      : [],
+    panelCount: activePanels.length,
     services,
     configured: services.views.enabled,
     updatedAt: doc?.updatedAt || null,
@@ -1640,15 +1652,18 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
     /* ---- Price the order and charge the wallet BEFORE scheduling ---- */
     // Total the units the client asked for, per label. Quantities are
     // re-derived here rather than trusted from any client-sent price.
+    /* Per-run quantities, in the same order addRuns() will schedule them, so
+       the price reflects the ACTUAL slot rotation rather than an even split.
+       With panels on different rates those two answers can differ a lot. */
     const unitTotals = {};
     for (const [label, value] of Object.entries(resolved)) {
-      unitTotals[label] = (value.runs || []).reduce((sum, run) => {
+      unitTotals[label] = (value.runs || []).map(run => {
         if (label === 'comments') {
           const lines = String(run.comments || '').split('\n').filter(l => l.trim());
-          return sum + Math.min(lines.length, 10);
+          return Math.min(lines.length, 10);
         }
-        return sum + Math.max(0, Math.floor(Number(run.quantity) || 0));
-      }, 0);
+        return Math.max(0, Math.floor(Number(run.quantity) || 0));
+      });
     }
 
     const quote = await computeQuote(unitTotals);
@@ -2255,30 +2270,91 @@ async function computeQuote(requestedUnits) {
   }
 
   const breakdown = {};
+  const slotBreakdown = [];      // per service-id detail, for owner accounts
   let costInr = 0;
   let missingRate = false;
 
   for (const label of SERVICE_LABELS) {
-    const units = Math.max(0, Math.floor(Number(requestedUnits?.[label]) || 0));
+    const requested = requestedUnits?.[label];
+    /* Two shapes are accepted:
+         - a number  -> a total, split evenly (used by the live estimate before
+           the run list exists)
+         - an array of per-run quantities -> priced against the SAME rotation
+           the scheduler will use, which is exact. */
+    const perRun = Array.isArray(requested)
+      ? requested.map(n => Math.max(0, Math.floor(Number(n) || 0))).filter(n => n > 0)
+      : null;
+    const units = perRun
+      ? perRun.reduce((a, b) => a + b, 0)
+      : Math.max(0, Math.floor(Number(requested) || 0));
     if (units <= 0) continue;
 
     const slots = usableSlots(cfg, label, panelsById);
     if (slots.length === 0) continue;
 
-    const unitsPerSlot = units / slots.length;
+    /* Work out how many units each slot really receives.
+       addRuns() assigns run i to slot (i % slots.length), so with uneven run
+       sizes the split is NOT 50/50. Mirroring that here is what makes the
+       quoted cost match the invoice. */
+    const unitsPerSlot = slots.map(() => 0);
+    const runsPerSlot = slots.map(() => 0);
+    if (perRun) {
+      perRun.forEach((qty, i) => {
+        const idx = i % slots.length;
+        unitsPerSlot[idx] += qty;
+        runsPerSlot[idx] += 1;
+      });
+    } else {
+      // No run list yet: fall back to an even split.
+      const even = units / slots.length;
+      for (let i = 0; i < slots.length; i++) unitsPerSlot[i] = even;
+    }
+
     let labelTotal = 0;
     let pricedAny = false;
 
-    for (const slot of slots) {
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      const slotUnits = unitsPerSlot[i];
       await loadPanel(slot.panelId);
       const rate = catalogueCache.get(slot.panelId)?.get(slot.serviceId);
-      if (!Number.isFinite(rate) || rate <= 0) { missingRate = true; continue; }
+      const panel = panelsById.get(slot.panelId);
+      const currency = currencyCache.get(slot.panelId) || 'INR';
 
-      const native = (unitsPerSlot / 1000) * rate;
-      const inr = await toInr(native, currencyCache.get(slot.panelId));
-      if (inr == null) { missingRate = true; continue; }
+      if (!Number.isFinite(rate) || rate <= 0) {
+        missingRate = true;
+        slotBreakdown.push({
+          label, serviceId: slot.serviceId,
+          panelId: slot.panelId, panelName: panel?.name || 'Unknown panel',
+          units: Math.round(slotUnits), runs: runsPerSlot[i],
+          rate: null, currency, costPaise: 0, priced: false,
+        });
+        continue;
+      }
+
+      const native = (slotUnits / 1000) * rate;
+      const inr = await toInr(native, currency);
+      if (inr == null) {
+        missingRate = true;
+        slotBreakdown.push({
+          label, serviceId: slot.serviceId,
+          panelId: slot.panelId, panelName: panel?.name || 'Unknown panel',
+          units: Math.round(slotUnits), runs: runsPerSlot[i],
+          rate, currency, costPaise: 0, priced: false,
+        });
+        continue;
+      }
+
       labelTotal += inr;
       pricedAny = true;
+      slotBreakdown.push({
+        label, serviceId: slot.serviceId,
+        panelId: slot.panelId, panelName: panel?.name || 'Unknown panel',
+        units: Math.round(slotUnits), runs: runsPerSlot[i],
+        rate, currency,
+        costPaise: Math.round(inr * 100),
+        priced: true,
+      });
     }
 
     if (pricedAny) {
@@ -2309,6 +2385,7 @@ async function computeQuote(requestedUnits) {
     costPaise,
     profitPaise: Math.max(0, totalPaise - costPaise),
     partial: missingRate,
+    slotBreakdown,
   };
 }
 
@@ -2345,6 +2422,21 @@ app.post('/api/quote', requireUser, async (req, res) => {
         panelCost: toRupees(quote.costPaise),
         commission: toRupees(quote.profitPaise),
         markupPercent: quote.markupPercent,
+        /* Per service-id detail so you can audit exactly which panel is
+           being charged what, and spot a mis-mapped or overpriced slot. */
+        slots: (quote.slotBreakdown || []).map(sb => ({
+          label: sb.label,
+          serviceId: sb.serviceId,
+          panelName: sb.panelName,
+          units: sb.units,
+          runs: sb.runs,
+          rate: sb.rate,
+          currency: sb.currency,
+          cost: toRupees(sb.costPaise),
+          priced: sb.priced,
+        })),
+        // True when the caller supplied real run sizes (exact, not estimated).
+        exact: Object.values(req.body?.services || {}).some(v => Array.isArray(v)),
       };
     }
 
@@ -3134,13 +3226,15 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/panel-config', async (_req, res) => {
+app.get('/api/panel-config', async (req, res) => {
   try {
     const doc = await getPanelConfig();
-    res.json(await publicPanelConfig(doc));
+    // Owner accounts may audit which provider serves each slot.
+    const user = await resolveUser(req).catch(() => null);
+    res.json(await publicPanelConfig(doc, { includeProviders: user?.isOwner === true }));
   } catch (e) {
     err('GET /api/panel-config:', e?.message || e);
-    res.status(500).json({ error: 'Could not load panel configuration' });
+    res.status(500).json({ error: 'Could not load configuration' });
   }
 });
 
