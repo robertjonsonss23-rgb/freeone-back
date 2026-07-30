@@ -230,6 +230,10 @@ const UserSchema = new mongoose.Schema({
   /* Wallet balance in paise (integer) — never floats, so repeated
      debits can't drift. ₹50.00 is stored as 5000. */
   balancePaise: { type: Number, default: 0, min: 0 },
+  /* Which currency this account prefers to SEE prices in. The wallet is
+     still held in rupees; this only affects formatting. */
+  displayCurrency:  { type: String, default: 'INR' },
+
   /* ---- Referrals ----
      Every account gets a short shareable code. `referredBy` records who
      invited them; the reward only pays out once their first deposit is
@@ -300,6 +304,19 @@ const PaymentSettingsSchema = new mongoose.Schema({
      admin can turn it off at any moment and every user is let straight in. */
   paywallEnabled:   { type: Boolean, default: false },
   paywallPricePaise:{ type: Number, default: 49900 },   // ₹499
+  /* ---- Display currencies ----
+     PRESENTATION ONLY. Every balance, price and ledger row stays in paise
+     (INR); these rates just change what a user is shown. `inrPerUnit` is
+     "how many rupees one unit is worth", so USD 83 means $1 = ₹83 and a
+     ₹499 price displays as $6.01. Rates are typed by the admin. */
+  currencies: [{
+    _id:        false,
+    code:       { type: String, required: true },   // USD, EUR, AED, PKR
+    symbol:     { type: String, default: '' },
+    inrPerUnit: { type: Number, required: true },
+    isActive:   { type: Boolean, default: true },
+  }],
+
   /* ---- Presentation mask for the Orders page ----
      When on, normal users never see failures, errors or long-pending runs;
      those display as 'completed'. Nothing about delivery changes — the
@@ -490,6 +507,7 @@ function publicUser(user) {
     balance: Math.round(Number(user.balancePaise) || 0) / 100,
     isOwner: user.isOwner === true,
     hasOrderAccess: user.hasOrderAccess === true,
+    displayCurrency: String(user.displayCurrency || 'INR').toUpperCase(),
     createdAt: user.createdAt,
   };
 }
@@ -596,9 +614,24 @@ function formatCrypto(micros) {
   return String(Number(value.toFixed(6)));
 }
 
+// Sensible starting points so the admin panel isn't an empty form.
+const CURRENCY_DEFAULTS = [
+  { code: 'USD', symbol: '$',   inrPerUnit: 83 },
+  { code: 'EUR', symbol: '€',   inrPerUnit: 90 },
+  { code: 'AED', symbol: 'د.إ', inrPerUnit: 23 },
+  { code: 'PKR', symbol: '₨',   inrPerUnit: 0.3 },
+];
+
 async function getPaymentSettings() {
   let doc = await PaymentSettings.findOne({ key: 'default' });
   if (!doc) doc = await PaymentSettings.create({ key: 'default' });
+  /* Seed starter currency rows once, so the admin edits real numbers rather
+     than an empty table. They start INACTIVE — nothing appears to users
+     until the admin has checked the rates and switched them on. */
+  if (!Array.isArray(doc.currencies) || doc.currencies.length === 0) {
+    doc.currencies = CURRENCY_DEFAULTS.map(c => ({ ...c, isActive: false }));
+    await doc.save();
+  }
   return doc;
 }
 
@@ -700,6 +733,7 @@ function publicPaymentSettings(doc) {
         amount: toRupees(p.amountPaise),
         crypto: formatCrypto(p.cryptoMicros),
       })),
+    currencies: activeCurrencies(doc),
     paywall: {
       enabled: Boolean(doc.paywallEnabled),
       price: toRupees(doc.paywallPricePaise),
@@ -887,6 +921,32 @@ async function maybePayReferral(userId, depositPaise) {
     err('maybePayReferral:', e?.message || e);
     return null;
   }
+}
+
+/* ============================================================
+   DISPLAY CURRENCIES
+   Nothing here touches stored money. Balances, charges, refunds and the
+   ledger remain integer paise; these helpers only decide how a number is
+   rendered for a given account.
+   ============================================================ */
+
+/** Currencies a user may pick: always INR, plus whatever the admin enabled. */
+function activeCurrencies(settings) {
+  const rows = (settings?.currencies || [])
+    .filter(c => c.isActive !== false && Number(c.inrPerUnit) > 0)
+    .map(c => ({
+      code: String(c.code).toUpperCase(),
+      symbol: c.symbol || '',
+      inrPerUnit: Number(c.inrPerUnit),
+    }));
+  return [{ code: 'INR', symbol: '₹', inrPerUnit: 1 }, ...rows];
+}
+
+/** The display settings for one account, falling back to INR. */
+function currencyFor(user, settings) {
+  const wanted = String(user?.displayCurrency || 'INR').toUpperCase();
+  const list = activeCurrencies(settings);
+  return list.find(c => c.code === wanted) || list[0];
 }
 
 /* ============================================================
@@ -2472,6 +2532,39 @@ app.get('/api/payment-methods', async (_req, res) => {
 });
 
 /* ============================================================
+   DISPLAY CURRENCY ROUTES
+   ============================================================ */
+
+/** Public: which currencies may be displayed, and at what rate. */
+app.get('/api/currencies', async (_req, res) => {
+  try {
+    const settings = await getPaymentSettings();
+    res.json({ currencies: activeCurrencies(settings) });
+  } catch (e) {
+    err('GET /api/currencies:', e?.message || e);
+    res.status(500).json({ error: 'Could not load currencies' });
+  }
+});
+
+/** Change the signed-in account's display currency. */
+app.post('/api/me/currency', requireUser, async (req, res) => {
+  try {
+    const code = String(req.body?.currency || '').trim().toUpperCase();
+    const settings = await getPaymentSettings();
+    const allowed = activeCurrencies(settings).some(c => c.code === code);
+    if (!allowed) {
+      return res.status(400).json({ error: 'That currency is not available' });
+    }
+    req.user.displayCurrency = code;
+    await req.user.save();
+    res.json({ success: true, displayCurrency: code, currency: currencyFor(req.user, settings) });
+  } catch (e) {
+    err('POST /api/me/currency:', e?.message || e);
+    res.status(500).json({ error: 'Could not change currency' });
+  }
+});
+
+/* ============================================================
    REFERRAL ROUTES
    ============================================================ */
 
@@ -3080,6 +3173,10 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
         crypto: formatCrypto(p.cryptoMicros),
         isActive: p.isActive !== false,
       })),
+      currencies: (doc.currencies || []).map(c => ({
+        code: c.code, symbol: c.symbol || '',
+        inrPerUnit: Number(c.inrPerUnit), isActive: c.isActive !== false,
+      })),
       hideRunProblems: Boolean(doc.hideRunProblems),
       pendingGraceMinutes: Number(doc.pendingGraceMinutes) || 15,
       referralEnabled: Boolean(doc.referralEnabled),
@@ -3120,6 +3217,28 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     }
     if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
+
+    /* ---- Display currency rates ----
+       `inrPerUnit` is how many rupees one unit of the currency is worth.
+       Rows without a positive rate are dropped rather than saved broken. */
+    if (Array.isArray(body.currencies)) {
+      const seen = new Set();
+      doc.currencies = body.currencies
+        .slice(0, 12)
+        .map(c => ({
+          code: String(c?.code || '').trim().toUpperCase().slice(0, 5),
+          symbol: String(c?.symbol || '').trim().slice(0, 4),
+          inrPerUnit: Number(c?.inrPerUnit),
+          isActive: c?.isActive !== false,
+        }))
+        .filter(c => {
+          if (!c.code || c.code === 'INR') return false;   // INR is implicit
+          if (!Number.isFinite(c.inrPerUnit) || c.inrPerUnit <= 0) return false;
+          if (seen.has(c.code)) return false;              // no duplicates
+          seen.add(c.code);
+          return true;
+        });
+    }
 
     /* ---- Orders display mask ---- */
     if (typeof body.hideRunProblems === 'boolean') doc.hideRunProblems = body.hideRunProblems;
