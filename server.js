@@ -300,6 +300,15 @@ const PaymentSettingsSchema = new mongoose.Schema({
      admin can turn it off at any moment and every user is let straight in. */
   paywallEnabled:   { type: Boolean, default: false },
   paywallPricePaise:{ type: Number, default: 49900 },   // ₹499
+  /* ---- Presentation mask for the Orders page ----
+     When on, normal users never see failures, errors or long-pending runs;
+     those display as 'completed'. Nothing about delivery changes — the
+     scheduler keeps retrying and the true state is kept in the database.
+     Owner accounts always see the real thing. */
+  hideRunProblems:        { type: Boolean, default: false },
+  // A pending run older than this reads as 'completed' to normal users.
+  pendingGraceMinutes:    { type: Number, default: 15 },
+
   /* ---- Referral programme ----
      Both sides get a flat reward, paid when the invited user's first
      deposit is approved. */
@@ -696,6 +705,78 @@ function publicPaymentSettings(doc) {
       title: doc.paywallTitle || 'Unlock New Order',
       blurb: doc.paywallBlurb || '',
     },
+  };
+}
+
+/* ============================================================
+   ORDERS DISPLAY MASK
+   A purely cosmetic layer over what a normal user is shown. The stored
+   run documents are never modified, so:
+     - the scheduler keeps retrying and can still deliver
+     - refunds on cancel still use the real state
+     - the admin panel and owner accounts see the truth
+   ============================================================ */
+
+/** Should this request see the real run state? */
+function seesRawRuns(user, settings) {
+  if (!settings || settings.hideRunProblems !== true) return true;  // mask off
+  return user?.isOwner === true;                                     // owners always
+}
+
+/* Present one run to a normal user.
+   - failed / retrying           -> completed, error stripped
+   - pending past the grace window -> completed
+   Everything else passes through untouched. */
+function maskRun(run, graceMs, nowMs) {
+  const status = String(run.status || '');
+  let shown = status;
+
+  if (status === 'failed' || status === 'retrying') {
+    shown = 'completed';
+  } else if (status === 'pending' || status === 'processing') {
+    // `time` is when the run was due; overdue by more than the grace window
+    // means the user has been staring at "pending" for too long.
+    const due = new Date(run.time || run.createdAt || nowMs).getTime();
+    if (Number.isFinite(due) && nowMs - due >= graceMs) shown = 'completed';
+  }
+
+  return {
+    ...run,
+    status: shown,
+    // Never leak the reason, the retry count, or a missing provider id.
+    error: shown === 'completed' && status !== 'completed' ? null : (run.error ?? null),
+    attempts: shown === 'completed' && status !== 'completed' ? 0 : (run.attempts ?? 0),
+  };
+}
+
+/** Recount an order's headline numbers from already-masked runs. */
+function maskOrderTotals(order, maskedRuns) {
+  const completed = maskedRuns.filter(r => r.status === 'completed').length;
+  const cancelled = maskedRuns.filter(r => r.status === 'cancelled').length;
+  const active = maskedRuns.length - cancelled;
+
+  let status = order.status;
+  // A cancelled order stays cancelled; otherwise hide 'failed' entirely.
+  if (status !== 'cancelled') {
+    if (active > 0 && completed === active) status = 'completed';
+    else if (status === 'failed') status = 'running';
+  }
+
+  return {
+    status,
+    completedRuns: completed,
+    runStatuses: maskedRuns.map(r => r.status),
+  };
+}
+
+/* Convenience: fetch the mask settings once per request. */
+async function runMaskContext(user) {
+  const settings = await getPaymentSettings();
+  const raw = seesRawRuns(user, settings);
+  return {
+    raw,
+    graceMs: Math.max(0, Number(settings.pendingGraceMinutes) || 0) * 60 * 1000,
+    now: Date.now(),
   };
 }
 
@@ -1443,9 +1524,14 @@ async function start() {
   procs.forEach(p => inFlight.add(inFlightKey(p.link, p.label)));
   log(`Initial in-flight tuples: ${inFlight.size}`);
 
-  // Start scheduler
-  setInterval(schedulerTick, TICK_INTERVAL_MS);
-  log(`🚀 Scheduler running every ${TICK_INTERVAL_MS / 1000}s`);
+  /* Start scheduler. SCHEDULER=off exists so the test suite can inspect run
+     states without the ticker racing it; never set this in production. */
+  if (String(process.env.SCHEDULER || '').toLowerCase() === 'off') {
+    warn('Scheduler is DISABLED (SCHEDULER=off). Runs will not execute.');
+  } else {
+    setInterval(schedulerTick, TICK_INTERVAL_MS);
+    log(`🚀 Scheduler running every ${TICK_INTERVAL_MS / 1000}s`);
+  }
 
   /* Keep the free instance awake. Without this the process sleeps after
      ~15 min idle and scheduled runs stop firing until someone visits. */
@@ -1725,15 +1811,23 @@ app.get('/api/order/status/:schedulerOrderId', requireUser, async (req, res) => 
     const order = await Order.findOne({ schedulerOrderId, userId: String(req.user._id) }).lean();
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const runs = await Run.find({ schedulerOrderId }).lean();
+    const rawRuns = await Run.find({ schedulerOrderId }).lean();
+    const mask = await runMaskContext(req.user);
+    const runs = mask.raw
+      ? rawRuns
+      : rawRuns.map(r => maskRun(r, mask.graceMs, mask.now));
+    const totals = mask.raw
+      ? { status: order.status, completedRuns: order.completedRuns, runStatuses: order.runStatuses }
+      : maskOrderTotals(order, runs);
+
     return res.json({
       schedulerOrderId: order.schedulerOrderId,
       name: order.name,
       link: order.link,
-      status: order.status,
+      status: totals.status,
       totalRuns: order.totalRuns,
-      completedRuns: order.completedRuns,
-      runStatuses: order.runStatuses,
+      completedRuns: totals.completedRuns,
+      runStatuses: totals.runStatuses,
       createdAt: order.createdAt,
       lastUpdatedAt: order.lastUpdatedAt,
       runs: runs.map(r => ({
@@ -1757,12 +1851,16 @@ app.get('/api/order/status/:schedulerOrderId', requireUser, async (req, res) => 
 app.get('/api/orders/status', requireUser, async (req, res) => {
   try {
     const orders = await Order.find({ userId: String(req.user._id) }).sort({ createdAt: -1 }).lean();
+    const mask = await runMaskContext(req.user);
     const result = await Promise.all(orders.map(async (o) => {
-      const runs = await Run.find(
+      const rawRuns = await Run.find(
         { schedulerOrderId: o.schedulerOrderId },
-        { id: 1, label: 1, quantity: 1, time: 1, status: 1, smmOrderId: 1 }
+        { id: 1, label: 1, quantity: 1, time: 1, status: 1, smmOrderId: 1, error: 1, attempts: 1 }
       ).lean();
-      return { ...o, runs };
+      if (mask.raw) return { ...o, runs: rawRuns };
+
+      const runs = rawRuns.map(r => maskRun(r, mask.graceMs, mask.now));
+      return { ...o, ...maskOrderTotals(o, runs), runs };
     }));
     return res.json({ total: orders.length, orders: result });
   } catch (e) {
@@ -1852,7 +1950,12 @@ app.get('/api/order/runs/:schedulerOrderId', requireUser, async (req, res) => {
     ).lean();
     if (!owned) return res.status(404).json({ error: 'Order not found' });
 
-    const runs = await Run.find({ schedulerOrderId: req.params.schedulerOrderId }).lean();
+    const rawRuns = await Run.find({ schedulerOrderId: req.params.schedulerOrderId }).lean();
+    const mask = await runMaskContext(req.user);
+    const runs = mask.raw
+      ? rawRuns
+      : rawRuns.map(r => maskRun(r, mask.graceMs, mask.now));
+
     return res.json({
       schedulerOrderId: req.params.schedulerOrderId,
       runs: runs.map(r => ({
@@ -2876,6 +2979,8 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
         crypto: formatCrypto(p.cryptoMicros),
         isActive: p.isActive !== false,
       })),
+      hideRunProblems: Boolean(doc.hideRunProblems),
+      pendingGraceMinutes: Number(doc.pendingGraceMinutes) || 15,
       referralEnabled: Boolean(doc.referralEnabled),
       referrerReward: toRupees(doc.referrerRewardPaise),
       refereeReward: toRupees(doc.refereeRewardPaise),
@@ -2914,6 +3019,16 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     }
     if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
+
+    /* ---- Orders display mask ---- */
+    if (typeof body.hideRunProblems === 'boolean') doc.hideRunProblems = body.hideRunProblems;
+    if (body.pendingGraceMinutes !== undefined) {
+      const mins = Number(body.pendingGraceMinutes);
+      if (!Number.isFinite(mins) || mins < 0 || mins > 1440) {
+        return res.status(400).json({ error: 'Grace period must be between 0 and 1440 minutes' });
+      }
+      doc.pendingGraceMinutes = Math.round(mins);
+    }
 
     /* ---- Referral programme ---- */
     if (typeof body.referralEnabled === 'boolean') doc.referralEnabled = body.referralEnabled;
