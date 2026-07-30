@@ -440,7 +440,6 @@ const Settings = mongoose.model('Settings', SettingsSchema);
    unnatural on the target platform. 100 is both the default and a hard
    floor — the UI can raise it, never lower it. */
 const MIN_VIEWS_FLOOR = 100;
-let MIN_VIEWS_PER_RUN = MIN_VIEWS_FLOOR;
 
 /* ============================================================
    USER AUTH (email + password)
@@ -1076,37 +1075,21 @@ async function adminPanelConfig(doc) {
 }
 
 async function loadSettings() {
+  /* Minimum views per run used to live here as a single shared value, which
+     meant one customer changing it silently re-planned everyone else's
+     orders. It is now chosen per order and validated against
+     MIN_VIEWS_FLOOR, so there is no cross-account setting left to load.
+     The old document is removed once, then this is a no-op. */
   try {
-    const setting = await Settings.findOne({ key: 'minViewsPerRun' }).lean();
-    if (setting && typeof setting.value === 'number' && setting.value >= 1) {
-      // Clamp on read so a legacy value like 10 is corrected automatically.
-      MIN_VIEWS_PER_RUN = Math.max(MIN_VIEWS_FLOOR, Math.floor(setting.value));
-      if (MIN_VIEWS_PER_RUN !== setting.value) {
-        await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
-        log(`✅ Raised stored MIN_VIEWS_PER_RUN ${setting.value} → ${MIN_VIEWS_PER_RUN} (floor)`);
-      } else {
-        log(`✅ Loaded MIN_VIEWS_PER_RUN from DB: ${MIN_VIEWS_PER_RUN}`);
-      }
-    } else {
-      await Settings.findOneAndUpdate(
-        { key: 'minViewsPerRun' },
-        { key: 'minViewsPerRun', value: MIN_VIEWS_PER_RUN, updatedAt: new Date() },
-        { upsert: true }
-      );
-      log(`✅ Saved default MIN_VIEWS_PER_RUN to DB: ${MIN_VIEWS_PER_RUN}`);
+    const legacy = await Settings.findOneAndDelete({ key: 'minViewsPerRun' });
+    if (legacy) {
+      log(`🧹 Removed the old shared minViewsPerRun setting (was ${legacy.value}); it is per-order now`);
     }
   } catch (e) {
-    warn('Could not load settings from DB:', e.message);
+    warn('Could not tidy legacy settings:', e.message);
   }
 }
 
-async function saveMinViewsSetting(value) {
-  await Settings.findOneAndUpdate(
-    { key: 'minViewsPerRun' },
-    { key: 'minViewsPerRun', value, updatedAt: new Date() },
-    { upsert: true }
-  );
-}
 
 /* ============================================================
    IN-FLIGHT TRACKING (rebuilt from DB at boot)
@@ -1186,8 +1169,10 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
       let commentsText = null;
 
       if (label === 'VIEWS') {
-        if (!run.quantity || run.quantity < MIN_VIEWS_PER_RUN) {
-          log(`[ADD] SKIP VIEWS qty=${run.quantity} < MIN=${MIN_VIEWS_PER_RUN}`);
+        /* The floor is a hard platform rule; anything above it is this
+           customer's own choice and must not depend on a shared setting. */
+        if (!run.quantity || run.quantity < MIN_VIEWS_FLOOR) {
+          log(`[ADD] SKIP VIEWS qty=${run.quantity} < FLOOR=${MIN_VIEWS_FLOOR}`);
           continue;
         }
         quantity = run.quantity;
@@ -1593,7 +1578,7 @@ async function start() {
   app.listen(PORT, '0.0.0.0', () => {
     log(`========================================`);
     log(`Server listening on port ${PORT}`);
-    log(`MIN_VIEWS_PER_RUN = ${MIN_VIEWS_PER_RUN}`);
+    log(`MIN_VIEWS_FLOOR = ${MIN_VIEWS_FLOOR} (per-order, not shared)`);
     log(`Keep-alive: ${KEEP_ALIVE_URL ? 'ON' : 'OFF'}`);
     log(`========================================`);
   });
@@ -2001,10 +1986,16 @@ app.get('/api/order/runs/:schedulerOrderId', requireUser, async (req, res) => {
 });
 
 // ---- Min-views setting ----
+/* Minimum views per run is a PER-ORDER choice, not a site-wide setting:
+   one customer raising it must never change anyone else's planning. This
+   endpoint therefore only reports the platform floor. */
 app.get('/api/settings/min-views', (_req, res) => {
-  res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN, minimum: MIN_VIEWS_FLOOR });
+  res.json({ minViewsPerRun: MIN_VIEWS_FLOOR, minimum: MIN_VIEWS_FLOOR });
 });
 
+/* Kept for backwards compatibility with older clients. It validates the
+   value but deliberately stores nothing — the figure now travels with each
+   order instead of being shared between accounts. */
 app.post('/api/settings/min-views', async (req, res) => {
   const { minViewsPerRun } = req.body || {};
   if (typeof minViewsPerRun !== 'number' || !Number.isFinite(minViewsPerRun)) {
@@ -2016,10 +2007,12 @@ app.post('/api/settings/min-views', async (req, res) => {
       minimum: MIN_VIEWS_FLOOR,
     });
   }
-  MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
-  await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
-  log(`MIN_VIEWS_PER_RUN updated → ${MIN_VIEWS_PER_RUN}`);
-  res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN, minimum: MIN_VIEWS_FLOOR });
+  res.json({
+    success: true,
+    minViewsPerRun: Math.floor(minViewsPerRun),
+    minimum: MIN_VIEWS_FLOOR,
+    perOrder: true,
+  });
 });
 
 // ---- Queue / system status ----
@@ -2031,7 +2024,7 @@ app.get('/api/queues/status', async (_req, res) => {
       pending,
       processing,
       inFlightTuples: inFlight.size,
-      minViewsPerRun: MIN_VIEWS_PER_RUN,
+      minViewsPerRun: MIN_VIEWS_FLOOR,
       // Backward-compatible structure for old frontend
       views:    { queueLength: 0, isExecuting: false },
       likes:    { queueLength: 0, isExecuting: false },
@@ -3614,7 +3607,7 @@ app.get('/api/health', async (_req, res) => {
     mongoConnected: mongoose.connection.readyState === 1,
     uptime: process.uptime(),
     inFlightTuples: inFlight.size,
-    minViewsPerRun: MIN_VIEWS_PER_RUN,
+    minViewsPerRun: MIN_VIEWS_FLOOR,
     // Delivery lag indicators
     overdueRuns: overdue,
     oldestOverdueMinutes,
