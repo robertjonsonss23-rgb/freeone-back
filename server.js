@@ -359,6 +359,10 @@ const PaymentSettingsSchema = new mongoose.Schema({
     isActive:    { type: Boolean, default: true },
     /* Ticker shown next to every crypto amount, e.g. "USDT". */
     coin:        { type: String, default: 'USDT' },
+    /* Rupees one unit of `coin` is worth. Set by the admin, same as the
+       display-currency rates. When > 0 the user may type any amount and we
+       convert it; when 0 they must pick one of the fixed packs below. */
+    inrPerUnit:  { type: Number, default: 0 },
   }],
   /* ---- Crypto pricing (no exchange rate; the admin types every figure) ----
      Amounts are integer micro-units (1 USDT = 1_000_000) so repeated maths
@@ -722,6 +726,7 @@ function publicPaymentSettings(doc) {
         address: m.address, instructions: m.instructions,
         qrImage: m.qrImage || '',
         coin: m.coin || 'USDT',
+        inrPerUnit: Number(m.inrPerUnit) || 0,
       })),
     /* Fixed top-up packs for crypto buyers. Sorted cheapest first so the
        list reads naturally. */
@@ -738,7 +743,7 @@ function publicPaymentSettings(doc) {
       enabled: Boolean(doc.paywallEnabled),
       price: toRupees(doc.paywallPricePaise),
       // "" when the admin hasn't priced the unlock in crypto yet.
-      cryptoPrice: doc.paywallCryptoMicros > 0 ? formatCrypto(doc.paywallCryptoMicros) : '',
+      cryptoPrice: paywallCryptoPrice(doc),
       title: doc.paywallTitle || 'Unlock New Order',
       blurb: doc.paywallBlurb || '',
     },
@@ -942,6 +947,20 @@ function activeCurrencies(settings) {
   return [{ code: 'INR', symbol: '₹', inrPerUnit: 1 }, ...rows];
 }
 
+/* What the unlock costs in crypto, as a display string.
+   Priority: the admin's explicit figure, else convert the rupee price using
+   the first active wallet's rate. Empty when neither is available. */
+function paywallCryptoPrice(settings) {
+  if (settings?.paywallCryptoMicros > 0) return formatCrypto(settings.paywallCryptoMicros);
+  const wallet = (settings?.cryptoMethods || []).find(
+    m => m.isActive !== false && Number(m.inrPerUnit) > 0
+  );
+  const rate = Number(wallet?.inrPerUnit) || 0;
+  if (rate <= 0) return '';
+  const rupees = toRupees(settings?.paywallPricePaise);
+  return formatCrypto(Math.round((rupees / rate) * CRYPTO_SCALE));
+}
+
 /** The display settings for one account, falling back to INR. */
 function currencyFor(user, settings) {
   const wanted = String(user?.displayCurrency || 'INR').toUpperCase();
@@ -975,8 +994,11 @@ function orderAccessPayload(user, settings) {
     unlocked: user?.hasOrderAccess === true,
     isOwner: user?.isOwner === true,
     price: toRupees(settings?.paywallPricePaise),
-    // "" when the admin hasn't set a crypto price — the UI then hides crypto.
-    cryptoPrice: settings?.paywallCryptoMicros > 0 ? formatCrypto(settings.paywallCryptoMicros) : '',
+    /* Crypto price for the unlock. An explicit figure wins; otherwise it is
+       derived from the first crypto wallet's rate, so setting one rate covers
+       both deposits and the paywall. "" means crypto isn't offered. */
+    cryptoPrice: paywallCryptoPrice(settings),
+    cryptoCoin: (settings?.cryptoMethods || []).find(m => m.isActive !== false)?.coin || 'USDT',
     title: settings?.paywallTitle || 'Unlock New Order',
     blurb: settings?.paywallBlurb || '',
     unlockedAt: user?.orderAccessAt || null,
@@ -2776,7 +2798,7 @@ app.post('/api/order-access/purchase', requireUser, async (req, res) => {
     }
     /* Without a crypto price there is no amount to ask for, so refuse rather
        than let someone "pay" an unstated sum. */
-    if (method === 'crypto' && !(settings.paywallCryptoMicros > 0)) {
+    if (method === 'crypto' && !paywallCryptoPrice(settings)) {
       return res.status(400).json({
         error: 'Crypto is not available for this unlock yet. Please pay by UPI or contact the administrator.',
       });
@@ -2816,7 +2838,7 @@ app.post('/api/order-access/purchase', requireUser, async (req, res) => {
       amountPaise: settings.paywallPricePaise,
       purpose: 'access',
       method, methodId, reference,
-      cryptoMicros: method === 'crypto' ? settings.paywallCryptoMicros : 0,
+      cryptoMicros: method === 'crypto' ? toMicros(paywallCryptoPrice(settings)) : 0,
       cryptoCoin: chosenCoin,
     });
 
@@ -3002,21 +3024,42 @@ app.post('/api/wallet/deposit', requireUser, async (req, res) => {
     let cryptoCoin = '';
 
     if (method === 'crypto') {
-      const packs = (settings.cryptoPacks || []).filter(
-        p => p.isActive && p.amountPaise > 0 && p.cryptoMicros > 0
-      );
-      if (packs.length === 0) {
-        return res.status(400).json({
-          error: 'No crypto top-up amounts are set up yet. Please use UPI or contact the administrator.',
-        });
+      const wallet = (settings.cryptoMethods || []).find(m => m.id === methodId);
+      cryptoCoin = wallet?.coin || 'USDT';
+      const rate = Number(wallet?.inrPerUnit) || 0;
+
+      if (rate > 0) {
+        /* A rate is configured, so the user may send any amount they like.
+           We convert THEIR figure to rupees here — the client never decides
+           what the wallet is credited. */
+        cryptoMicros = toMicros(req.body?.cryptoAmount);
+        if (!Number.isFinite(cryptoMicros) || cryptoMicros <= 0) {
+          return res.status(400).json({ error: `Enter how much ${cryptoCoin} you sent` });
+        }
+        amountPaise = Math.round(fromMicros(cryptoMicros) * rate * 100);
+        if (amountPaise < settings.minDepositPaise) {
+          const minUnits = formatCrypto(Math.ceil((settings.minDepositPaise / 100 / rate) * CRYPTO_SCALE));
+          return res.status(400).json({
+            error: `Minimum deposit is ₹${toRupees(settings.minDepositPaise)} (about ${minUnits} ${cryptoCoin})`,
+          });
+        }
+      } else {
+        // No rate set: fall back to the admin's fixed packs.
+        const packs = (settings.cryptoPacks || []).filter(
+          p => p.isActive && p.amountPaise > 0 && p.cryptoMicros > 0
+        );
+        if (packs.length === 0) {
+          return res.status(400).json({
+            error: 'No crypto top-up amounts are set up yet. Please use UPI or contact the administrator.',
+          });
+        }
+        const pack = packs.find(p => p.id === packId);
+        if (!pack) {
+          return res.status(400).json({ error: 'Choose one of the available crypto amounts' });
+        }
+        amountPaise = pack.amountPaise;
+        cryptoMicros = pack.cryptoMicros;
       }
-      const pack = packs.find(p => p.id === packId);
-      if (!pack) {
-        return res.status(400).json({ error: 'Choose one of the available crypto amounts' });
-      }
-      amountPaise = pack.amountPaise;
-      cryptoMicros = pack.cryptoMicros;
-      cryptoCoin = (settings.cryptoMethods || []).find(m => m.id === methodId)?.coin || 'USDT';
     } else {
       amountPaise = toPaise(req.body?.amount);
       if (!Number.isFinite(amountPaise) || amountPaise < settings.minDepositPaise) {
@@ -3242,6 +3285,7 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
         id: m.id, label: m.label, network: m.network, address: m.address,
         instructions: m.instructions, qrImage: m.qrImage || '',
         isActive: m.isActive !== false, coin: m.coin || 'USDT',
+        inrPerUnit: Number(m.inrPerUnit) || 0,
       })),
       cryptoPacks: (doc.cryptoPacks || []).map(p => ({
         id: p.id,
@@ -3385,6 +3429,7 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
           qrImage: sanitizeQrImage(m?.qrImage, existing.get(id)?.qrImage || ''),
           isActive: m?.isActive !== false,
           coin: (String(m?.coin || 'USDT').trim().toUpperCase().slice(0, 10)) || 'USDT',
+          inrPerUnit: Math.max(0, Number(m?.inrPerUnit) || 0),
         };
       });
     }
