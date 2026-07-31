@@ -317,6 +317,11 @@ const PaymentSettingsSchema = new mongoose.Schema({
     isActive:   { type: Boolean, default: true },
   }],
 
+  /* ---- Low-balance alerts ----
+     Telegram ping when a panel's account drops below this, so you top up
+     before deliveries start failing. 0 disables the alerts. */
+  lowBalanceThreshold: { type: Number, default: 0 },
+
   /* ---- Presentation mask for the Orders page ----
      When on, normal users never see failures, errors or long-pending runs;
      those display as 'completed'. Nothing about delivery changes — the
@@ -1640,6 +1645,11 @@ async function start() {
     warn('Keep-alive is OFF. On Render free tier the scheduler will stop when the instance sleeps.');
   }
 
+  /* Low panel balance -> Telegram. Checked hourly; the first check is
+     delayed a little so boot isn't slowed by provider calls. */
+  setTimeout(() => { checkPanelBalances().catch(() => {}); }, 60_000);
+  setInterval(() => { checkPanelBalances().catch(() => {}); }, LOW_BALANCE_CHECK_MS);
+
   /* Warn loudly when delivery is drifting, so the logs show the problem
      rather than it being silent. */
   setInterval(async () => {
@@ -2368,6 +2378,144 @@ async function fetchPanelCatalogue(panel) {
   } catch { /* default to INR */ }
 
   return { rates, currency, ok };
+}
+
+/* ============================================================
+   PANEL BALANCE
+   Read the credit left in each provider account, so the admin panel can
+   show it and a Telegram alert can fire before deliveries start failing
+   for lack of funds.
+   ============================================================ */
+const PANEL_BALANCE_TTL_MS = 5 * 60 * 1000;
+const panelBalanceCache = new Map();     // panelId -> { balance, currency, inr, fetchedAt, ok, error }
+
+function extractPanelBalance(body) {
+  const candidates = [
+    body?.balance, body?.funds, body?.amount,
+    body?.data?.balance, body?.account?.balance, body?.user?.balance,
+  ];
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null) continue;
+    // Providers return "12.34", "$12.34" or 12.34 — strip anything else.
+    const value = Number(String(candidate).replace(/[^\d.-]/g, ''));
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+/** Live balance for one panel, cached briefly. `force` skips the cache. */
+async function getPanelBalance(panel, { force = false } = {}) {
+  const id = String(panel._id);
+  const cached = panelBalanceCache.get(id);
+  if (!force && cached && Date.now() - cached.fetchedAt < PANEL_BALANCE_TTL_MS) return cached;
+
+  let entry;
+  try {
+    const params = new URLSearchParams({ key: panel.apiKey, action: 'balance' });
+    const response = await axios.post(panel.apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: PROVIDER_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+    const balance = extractPanelBalance(response.data);
+    const currency = extractPanelCurrency(response.data) || 'INR';
+    if (balance == null) throw new Error('Panel did not return a balance');
+
+    /* Convert to rupees so balances across panels on different currencies
+       can be compared, and one threshold covers them all. */
+    let inr = balance;
+    if (currency !== 'INR') {
+      try {
+        const fx = await getInrExchangeRate(currency);
+        inr = balance * fx.rate;
+      } catch { inr = null; }
+    }
+    entry = { balance, currency, inr, fetchedAt: Date.now(), ok: true, error: '' };
+  } catch (e) {
+    entry = {
+      balance: null, currency: '', inr: null,
+      fetchedAt: Date.now(), ok: false,
+      error: e?.message || 'Could not read balance',
+    };
+  }
+  panelBalanceCache.set(id, entry);
+  return entry;
+}
+
+/** Balances for every panel, fetched in parallel. */
+async function getAllPanelBalances({ force = false } = {}) {
+  const panels = await Panel.find().sort({ createdAt: 1 }).lean();
+  const rows = await Promise.all(panels.map(async (p) => {
+    const b = await getPanelBalance(p, { force });
+    return {
+      id: String(p._id),
+      name: p.name,
+      isActive: p.isActive !== false,
+      balance: b.balance,
+      currency: b.currency,
+      balanceInr: b.inr == null ? null : Math.round(b.inr * 100) / 100,
+      ok: b.ok,
+      error: b.error,
+      checkedAt: new Date(b.fetchedAt).toISOString(),
+    };
+  }));
+  return rows;
+}
+
+/* ---- Low-balance alerting ----
+   Fires once when a panel crosses below the threshold, then stays quiet
+   until it recovers. Without that latch a low panel would ping every
+   check and you'd start ignoring the alerts. */
+const lowBalanceAlerted = new Set();     // panelIds currently in the "warned" state
+const LOW_BALANCE_CHECK_MS = 60 * 60 * 1000;
+
+async function checkPanelBalances({ force = false } = {}) {
+  try {
+    const settings = await getPaymentSettings();
+    const threshold = Number(settings.lowBalanceThreshold) || 0;
+    if (threshold <= 0) return { checked: 0, alerted: 0 };
+
+    const rows = await getAllPanelBalances({ force });
+    let alerted = 0;
+
+    for (const row of rows) {
+      if (!row.isActive) continue;
+      // An unreadable balance is a separate problem; don't guess it's low.
+      if (!row.ok || row.balanceInr == null) continue;
+
+      const isLow = row.balanceInr < threshold;
+      const alreadyWarned = lowBalanceAlerted.has(row.id);
+
+      if (isLow && !alreadyWarned) {
+        lowBalanceAlerted.add(row.id);
+        alerted += 1;
+        const native = row.currency && row.currency !== 'INR'
+          ? ` (${row.balance} ${row.currency})`
+          : '';
+        log(`⚠️  Low panel balance: ${row.name} ₹${row.balanceInr}`);
+        notifyTelegram(
+          `🔋 <b>Low panel balance</b>\n\n` +
+          `Panel: <b>${tgEscape(row.name)}</b>\n` +
+          `Left: <b>₹${row.balanceInr}</b>${tgEscape(native)}\n` +
+          `Alert below: ₹${threshold}\n\n` +
+          `Top this panel up, or orders using it will start failing.`
+        );
+      } else if (!isLow && alreadyWarned) {
+        // Recovered — clear the latch and say so.
+        lowBalanceAlerted.delete(row.id);
+        log(`✅ Panel balance recovered: ${row.name} ₹${row.balanceInr}`);
+        notifyTelegram(
+          `✅ <b>Panel topped up</b>\n\n` +
+          `Panel: <b>${tgEscape(row.name)}</b>\n` +
+          `Balance: <b>₹${row.balanceInr}</b>`
+        );
+      }
+    }
+    return { checked: rows.length, alerted };
+  } catch (e) {
+    err('checkPanelBalances:', e?.message || e);
+    return { checked: 0, alerted: 0 };
+  }
 }
 
 /** Cached rate list + account currency for one panel. */
@@ -3297,6 +3445,7 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
         code: c.code, symbol: c.symbol || '',
         inrPerUnit: Number(c.inrPerUnit), isActive: c.isActive !== false,
       })),
+      lowBalanceThreshold: Number(doc.lowBalanceThreshold) || 0,
       hideRunProblems: Boolean(doc.hideRunProblems),
       pendingGraceMinutes: Number(doc.pendingGraceMinutes) || 15,
       referralEnabled: Boolean(doc.referralEnabled),
@@ -3358,6 +3507,15 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
           seen.add(c.code);
           return true;
         });
+    }
+
+    /* ---- Low-balance alert threshold ---- */
+    if (body.lowBalanceThreshold !== undefined) {
+      const value = Number(body.lowBalanceThreshold);
+      if (!Number.isFinite(value) || value < 0) {
+        return res.status(400).json({ error: 'Low-balance threshold cannot be negative' });
+      }
+      doc.lowBalanceThreshold = value;
     }
 
     /* ---- Orders display mask ---- */
@@ -3632,6 +3790,38 @@ app.post('/api/admin/service-slots', requireAdmin, async (req, res) => {
 });
 
 // ---- Admin: list registered users ----
+/* ---- Admin: live balances of every connected panel ----
+   `?refresh=1` bypasses the 5-minute cache. */
+app.get('/api/admin/panel-balances', requireAdmin, async (req, res) => {
+  try {
+    const force = String(req.query?.refresh || '') === '1';
+    const settings = await getPaymentSettings();
+    const panels = await getAllPanelBalances({ force });
+    const threshold = Number(settings.lowBalanceThreshold) || 0;
+    res.json({
+      threshold,
+      panels: panels.map(p => ({
+        ...p,
+        isLow: threshold > 0 && p.ok && p.balanceInr != null && p.balanceInr < threshold,
+      })),
+    });
+  } catch (e) {
+    err('GET /api/admin/panel-balances:', e?.message || e);
+    res.status(500).json({ error: 'Could not read panel balances' });
+  }
+});
+
+/* ---- Admin: run the low-balance check now (also used to test alerts) ---- */
+app.post('/api/admin/panel-balances/check', requireAdmin, async (_req, res) => {
+  try {
+    const result = await checkPanelBalances({ force: true });
+    res.json({ success: true, ...result });
+  } catch (e) {
+    err('POST /api/admin/panel-balances/check:', e?.message || e);
+    res.status(500).json({ error: 'Could not run the balance check' });
+  }
+});
+
 /* ---- Admin: send a test Telegram alert ----
    Lets you confirm the bot token and chat id actually work without
    having to make a real payment. */
