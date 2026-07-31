@@ -151,6 +151,8 @@ async function notifyTelegram(text) {
 const RunSchema = new mongoose.Schema({
   // Stable string id (no float collisions)
   id:                  { type: String, required: true, index: true, unique: true },
+  // Which platform this run targets. Older runs predate this and read as ''.
+  platform:            { type: String, default: '' },
   schedulerOrderId:    { type: String, required: true, index: true },
   label:               { type: String, required: true }, // VIEWS / LIKES / SHARES / SAVES / REPOSTS / COMMENTS
   apiUrl:              { type: String, required: true },
@@ -192,6 +194,7 @@ const OrderSchema = new mongoose.Schema({
     enum: ['pending', 'running', 'paused', 'cancelled', 'completed', 'failed'],
     default: 'pending',
   },
+  platform:         { type: String, default: '' },
   totalRuns:        { type: Number, required: true },
   completedRuns:    { type: Number, default: 0 },
   // What the user paid, in paise. Used for pro-rata refunds on cancel.
@@ -433,6 +436,8 @@ const PanelConfigSchema = new mongoose.Schema({
     comments: { type: String, default: '' },
     reposts:  { type: String, default: '' },
   },
+  /* Legacy single-platform slots. Migrated into platformSlots.instagram on
+     boot, then left alone so an older build could still read them. */
   serviceSlots: {
     views:    { type: [SlotSchema], default: [] },
     likes:    { type: [SlotSchema], default: [] },
@@ -441,7 +446,11 @@ const PanelConfigSchema = new mongoose.Schema({
     comments: { type: [SlotSchema], default: [] },
     reposts:  { type: [SlotSchema], default: [] },
   },
+  /* Per-platform mapping: platformSlots.tiktok.views = [ {panelId, serviceId} ].
+     Mixed type because the metric list differs per platform. */
+  platformSlots:   { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
   migratedToSlots: { type: Boolean, default: false },
+  migratedToPlatforms: { type: Boolean, default: false },
   updatedAt:  { type: Date, default: Date.now },
 });
 
@@ -592,7 +601,50 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-const SERVICE_LABELS = ['views', 'likes', 'shares', 'saves', 'comments', 'reposts'];
+/* ============================================================
+   PLATFORMS
+   Each platform has its own service ids on the provider side, and its own
+   meaningful engagement types — YouTube has no "saves", TikTok has no
+   "reposts" in the Instagram sense. Everything below is derived from this
+   one table, so adding a platform later is a single edit.
+   ============================================================ */
+const PLATFORMS = ['instagram', 'tiktok', 'youtube'];
+const DEFAULT_PLATFORM = 'instagram';
+
+const PLATFORM_METRICS = {
+  instagram: ['views', 'likes', 'shares', 'saves', 'comments', 'reposts'],
+  tiktok:    ['views', 'likes', 'shares', 'saves', 'comments', 'followers'],
+  youtube:   ['views', 'likes', 'comments', 'subscribers'],
+};
+
+const PLATFORM_LABELS = {
+  instagram: 'Instagram',
+  tiktok: 'TikTok',
+  youtube: 'YouTube',
+};
+
+/* Every metric used by any platform. The runs collection and the pricing
+   code work off this union, so a metric only has to be listed once above. */
+const SERVICE_LABELS = [...new Set(Object.values(PLATFORM_METRICS).flat())];
+
+function normalizePlatform(value) {
+  const v = String(value || '').trim().toLowerCase();
+  return PLATFORMS.includes(v) ? v : DEFAULT_PLATFORM;
+}
+
+/** Is this metric meaningful on this platform? */
+function metricAllowed(platform, metric) {
+  return (PLATFORM_METRICS[normalizePlatform(platform)] || []).includes(String(metric).toLowerCase());
+}
+
+function emptyPlatformSlots() {
+  const out = {};
+  for (const p of PLATFORMS) {
+    out[p] = {};
+    for (const m of PLATFORM_METRICS[p]) out[p][m] = [];
+  }
+  return out;
+}
 
 /* ============================================================
    WALLET
@@ -1044,6 +1096,53 @@ async function getPanelConfig() {
 
 /* One-time upgrade from the single-panel shape to panels + slots.
    Existing installs keep working with no manual re-entry. */
+/* One-time upgrade to per-platform slots.
+   Everything currently mapped is Instagram, so it moves there verbatim and
+   the other platforms start empty. Runs idempotently and never deletes the
+   old data, so a rollback is possible. */
+async function migrateToPlatforms() {
+  const cfg = await getPanelConfig();
+  const existing = cfg.platformSlots && typeof cfg.platformSlots === 'object'
+    ? cfg.platformSlots
+    : {};
+
+  const next = emptyPlatformSlots();
+  // Preserve anything already stored per-platform.
+  for (const platform of PLATFORMS) {
+    for (const metric of PLATFORM_METRICS[platform]) {
+      const rows = existing?.[platform]?.[metric];
+      if (Array.isArray(rows) && rows.length > 0) {
+        next[platform][metric] = rows.map(r => ({
+          panelId: String(r.panelId || ''),
+          serviceId: String(r.serviceId || ''),
+        }));
+      }
+    }
+  }
+
+  if (!cfg.migratedToPlatforms) {
+    let moved = 0;
+    for (const metric of PLATFORM_METRICS[DEFAULT_PLATFORM]) {
+      const legacy = cfg.serviceSlots?.[metric] || [];
+      // Don't clobber a platform mapping that already exists.
+      if (legacy.length > 0 && next[DEFAULT_PLATFORM][metric].length === 0) {
+        next[DEFAULT_PLATFORM][metric] = legacy.map(r => ({
+          panelId: String(r.panelId || ''),
+          serviceId: String(r.serviceId || ''),
+        }));
+        moved += legacy.length;
+      }
+    }
+    cfg.migratedToPlatforms = true;
+    if (moved > 0) log(`🔀 Moved ${moved} existing service slot(s) to Instagram`);
+  }
+
+  cfg.platformSlots = next;
+  cfg.markModified('platformSlots');
+  cfg.updatedAt = new Date();
+  await cfg.save();
+}
+
 async function migrateToMultiPanel() {
   const cfg = await getPanelConfig();
   if (cfg.migratedToSlots) return;
@@ -1078,9 +1177,15 @@ async function migrateToMultiPanel() {
   log('🔀 Service mapping migrated to rotating slots');
 }
 
-/** Slots for a label, dropping any that point at a missing/inactive panel. */
-function usableSlots(cfg, label, panelsById) {
-  const slots = (cfg?.serviceSlots?.[label] || []).map(s => ({
+/** Slots for one platform+metric, dropping any that point at a dead panel. */
+function usableSlots(cfg, label, panelsById, platform = DEFAULT_PLATFORM) {
+  const p = normalizePlatform(platform);
+  /* Read the per-platform map; fall back to the legacy flat map for
+     Instagram so an un-migrated install keeps working. */
+  const raw = cfg?.platformSlots?.[p]?.[label]
+    ?? (p === DEFAULT_PLATFORM ? cfg?.serviceSlots?.[label] : null)
+    ?? [];
+  const slots = raw.map(s => ({
     panelId: String(s.panelId || ''),
     serviceId: String(s.serviceId || '').trim(),
   }));
@@ -1103,10 +1208,10 @@ async function loadPanelsById() {
    are only included for owner accounts. */
 async function publicPanelConfig(doc, { includeProviders = false } = {}) {
   const panelsById = await loadPanelsById();
-  const services = {};
-  for (const label of SERVICE_LABELS) {
-    const slots = usableSlots(doc, label, panelsById);
-    services[label] = {
+
+  const describe = (platform, label) => {
+    const slots = usableSlots(doc, label, panelsById, platform);
+    return {
       enabled: slots.length > 0,
       count: slots.length,
       rotating: slots.length > 1,
@@ -1120,7 +1225,28 @@ async function publicPanelConfig(doc, { includeProviders = false } = {}) {
           }
         : {}),
     };
+  };
+
+  /* Per-platform availability, so the New Order page can show only the
+     engagement types that platform actually supports AND has mapped. */
+  const platforms = {};
+  for (const platform of PLATFORMS) {
+    const services = {};
+    for (const label of PLATFORM_METRICS[platform]) services[label] = describe(platform, label);
+    platforms[platform] = {
+      key: platform,
+      label: PLATFORM_LABELS[platform],
+      metrics: PLATFORM_METRICS[platform],
+      services,
+      // A platform is usable once its Views mapping exists.
+      configured: services.views?.enabled === true,
+    };
   }
+
+  // Flat view of the default platform, so older clients keep working.
+  const services = {};
+  for (const label of SERVICE_LABELS) services[label] = describe(DEFAULT_PLATFORM, label);
+
   const activePanels = [...panelsById.values()].filter(p => p.isActive !== false);
   return {
     // Normal users get a count only; owners get the real list.
@@ -1128,8 +1254,9 @@ async function publicPanelConfig(doc, { includeProviders = false } = {}) {
       ? activePanels.map(p => ({ id: String(p._id), name: p.name }))
       : [],
     panelCount: activePanels.length,
+    platforms,
     services,
-    configured: services.views.enabled,
+    configured: Object.values(platforms).some(p => p.configured),
     updatedAt: doc?.updatedAt || null,
   };
 }
@@ -1146,6 +1273,24 @@ async function adminPanelConfig(doc) {
       panelName: panelsById.get(String(s.panelId))?.name || 'Missing panel',
     }));
   }
+  /* The editable per-platform mapping. */
+  const platformSlots = {};
+  const platformConfigured = {};
+  for (const platform of PLATFORMS) {
+    platformSlots[platform] = {};
+    for (const metric of PLATFORM_METRICS[platform]) {
+      const raw = doc?.platformSlots?.[platform]?.[metric]
+        ?? (platform === DEFAULT_PLATFORM ? doc?.serviceSlots?.[metric] : null)
+        ?? [];
+      platformSlots[platform][metric] = raw.map(s => ({
+        panelId: String(s.panelId || ''),
+        serviceId: String(s.serviceId || ''),
+        panelName: panelsById.get(String(s.panelId))?.name || 'Missing panel',
+      }));
+    }
+    platformConfigured[platform] = usableSlots(doc, 'views', panelsById, platform).length > 0;
+  }
+
   return {
     panels: panels.map(p => ({
       id: String(p._id),
@@ -1156,7 +1301,10 @@ async function adminPanelConfig(doc) {
       createdAt: p.createdAt,
     })),
     serviceSlots,
-    configured: usableSlots(doc, 'views', panelsById).length > 0,
+    platformSlots,
+    platformConfigured,
+    platforms: PLATFORMS.map(k => ({ key: k, label: PLATFORM_LABELS[k], metrics: PLATFORM_METRICS[k] })),
+    configured: Object.values(platformConfigured).some(Boolean),
     updatedAt: doc?.updatedAt || null,
   };
 }
@@ -1304,6 +1452,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
       docs.push({
         id: makeRunId(),
         schedulerOrderId,
+        platform: baseConfig.platform || DEFAULT_PLATFORM,
         label,
         apiUrl: slot.apiUrl,
         apiKey: slot.apiKey,
@@ -1597,6 +1746,7 @@ async function start() {
 
   await loadSettings();
   await migrateToMultiPanel();
+  await migrateToPlatforms();
 
   // Drop expired sessions so the collection doesn't grow without bound.
   const purged = await Session.deleteMany({ expiresAt: { $lt: new Date() } });
@@ -1698,6 +1848,7 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
     if (!link || !services) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+    const platform = normalizePlatform(req.body?.platform);
 
     /* Credentials come from the admin-managed config, NEVER from the client.
        Service ids are likewise resolved server-side, so a user cannot order
@@ -1710,10 +1861,12 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
       if (!value) continue;
       const normalized = String(label).toLowerCase();
       if (!SERVICE_LABELS.includes(normalized)) continue;
+      // Silently drop metrics this platform doesn't support (YouTube saves).
+      if (!metricAllowed(platform, normalized)) continue;
 
       // Attach each slot's own panel credentials so runs can rotate across
       // different providers.
-      const slots = usableSlots(cfg, normalized, panelsById).map(slot => {
+      const slots = usableSlots(cfg, normalized, panelsById, platform).map(slot => {
         const panel = panelsById.get(slot.panelId);
         return {
           serviceId: slot.serviceId,
@@ -1753,7 +1906,7 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
       });
     }
 
-    const quote = await computeQuote(unitTotals);
+    const quote = await computeQuote(unitTotals, platform);
     if (!quote.available) {
       return res.status(503).json({ error: quote.reason || 'Could not price this order.' });
     }
@@ -1778,7 +1931,7 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
 
     let runs;
     try {
-      runs = await addRuns(resolved, { link }, schedulerOrderId);
+      runs = await addRuns(resolved, { link, platform }, schedulerOrderId);
     } catch (e) {
       // Scheduling blew up after taking the money — hand it straight back.
       await creditWallet(req.user._id, quote.totalPaise, {
@@ -1805,6 +1958,7 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
       userId: String(req.user._id),
       name: name || `Order ${schedulerOrderId}`,
       link,
+      platform,
       chargedPaise: quote.totalPaise,
       status: 'pending',
       totalRuns: runs.length,
@@ -1926,6 +2080,7 @@ app.get('/api/order/status/:schedulerOrderId', requireUser, async (req, res) => 
       schedulerOrderId: order.schedulerOrderId,
       name: order.name,
       link: order.link,
+      platform: order.platform || DEFAULT_PLATFORM,
       status: totals.status,
       totalRuns: order.totalRuns,
       completedRuns: totals.completedRuns,
@@ -2551,7 +2706,8 @@ async function getPanelCatalogue(panel) {
   return promise;
 }
 
-async function computeQuote(requestedUnits) {
+async function computeQuote(requestedUnits, platformArg = DEFAULT_PLATFORM) {
+  const platform = normalizePlatform(platformArg);
   const cfg = await getPanelConfig();
   const panelsById = await loadPanelsById();
   const settings = await getPaymentSettings();
@@ -2590,6 +2746,7 @@ async function computeQuote(requestedUnits) {
   let missingRate = false;
 
   for (const label of SERVICE_LABELS) {
+    if (!metricAllowed(platform, label)) continue;
     const requested = requestedUnits?.[label];
     /* Two shapes are accepted:
          - a number  -> a total, split evenly (used by the live estimate before
@@ -2604,7 +2761,7 @@ async function computeQuote(requestedUnits) {
       : Math.max(0, Math.floor(Number(requested) || 0));
     if (units <= 0) continue;
 
-    const slots = usableSlots(cfg, label, panelsById);
+    const slots = usableSlots(cfg, label, panelsById, platform);
     if (slots.length === 0) continue;
 
     /* Work out how many units each slot really receives.
@@ -2639,7 +2796,7 @@ async function computeQuote(requestedUnits) {
       if (!Number.isFinite(rate) || rate <= 0) {
         missingRate = true;
         slotBreakdown.push({
-          label, serviceId: slot.serviceId,
+          platform, label, serviceId: slot.serviceId,
           panelId: slot.panelId, panelName: panel?.name || 'Unknown panel',
           units: Math.round(slotUnits), runs: runsPerSlot[i],
           rate: null, currency, costPaise: 0, priced: false,
@@ -2652,7 +2809,7 @@ async function computeQuote(requestedUnits) {
       if (inr == null) {
         missingRate = true;
         slotBreakdown.push({
-          label, serviceId: slot.serviceId,
+          platform, label, serviceId: slot.serviceId,
           panelId: slot.panelId, panelName: panel?.name || 'Unknown panel',
           units: Math.round(slotUnits), runs: runsPerSlot[i],
           rate, currency, costPaise: 0, priced: false,
@@ -2663,7 +2820,7 @@ async function computeQuote(requestedUnits) {
       labelTotal += inr;
       pricedAny = true;
       slotBreakdown.push({
-        label, serviceId: slot.serviceId,
+        platform, label, serviceId: slot.serviceId,
         panelId: slot.panelId, panelName: panel?.name || 'Unknown panel',
         units: Math.round(slotUnits), runs: runsPerSlot[i],
         rate, currency,
@@ -2709,7 +2866,7 @@ app.post('/api/quote', requireUser, async (req, res) => {
     const requested = req.body?.services && typeof req.body.services === 'object'
       ? req.body.services
       : {};
-    const quote = await computeQuote(requested);
+    const quote = await computeQuote(requested, req.body?.platform);
 
     if (!quote.available) {
       return res.json({ available: false, reason: quote.reason });
@@ -2774,6 +2931,26 @@ app.get('/api/payment-methods', async (_req, res) => {
   } catch (e) {
     err('GET /api/payment-methods:', e?.message || e);
     res.status(500).json({ error: 'Could not load payment methods' });
+  }
+});
+
+/** Public: which platforms exist and what each supports. */
+app.get('/api/platforms', async (_req, res) => {
+  try {
+    const doc = await getPanelConfig();
+    const panelsById = await loadPanelsById();
+    res.json({
+      platforms: PLATFORMS.map(key => ({
+        key,
+        label: PLATFORM_LABELS[key],
+        metrics: PLATFORM_METRICS[key],
+        configured: usableSlots(doc, 'views', panelsById, key).length > 0,
+      })),
+      defaultPlatform: DEFAULT_PLATFORM,
+    });
+  } catch (e) {
+    err('GET /api/platforms:', e?.message || e);
+    res.status(500).json({ error: 'Could not load platforms' });
   }
 });
 
@@ -3760,30 +3937,53 @@ app.post('/api/admin/service-slots', requireAdmin, async (req, res) => {
 
     const doc = await getPanelConfig();
     const panelsById = await loadPanelsById();
+    /* Which platform is being edited. Older clients send no platform and
+       mean Instagram, which keeps them working unchanged. */
+    const platform = normalizePlatform(req.body?.platform);
 
-    for (const label of SERVICE_LABELS) {
-      if (!(label in incoming)) continue;
-      const rows = Array.isArray(incoming[label]) ? incoming[label] : [];
-
+    const clean = (rows, label) => {
       const cleaned = [];
-      for (const row of rows.slice(0, 10)) { // hard cap, keeps rotation sane
+      for (const row of (Array.isArray(rows) ? rows : []).slice(0, 10)) {
         const panelId = String(row?.panelId || '').trim();
         const serviceId = String(row?.serviceId || '').trim();
         if (!panelId || !serviceId) continue;
-        if (!panelsById.has(panelId)) {
-          return res.status(400).json({ error: `Unknown panel for ${label}` });
-        }
+        if (!panelsById.has(panelId)) throw new Error(`Unknown panel for ${label}`);
         cleaned.push({ panelId, serviceId });
       }
-      doc.serviceSlots[label] = cleaned;
+      return cleaned;
+    };
+
+    // Start from what's stored so editing one platform can't wipe another.
+    const next = (doc.platformSlots && typeof doc.platformSlots === 'object')
+      ? JSON.parse(JSON.stringify(doc.platformSlots))
+      : {};
+    for (const pf of PLATFORMS) {
+      if (!next[pf]) next[pf] = {};
+      for (const m of PLATFORM_METRICS[pf]) if (!next[pf][m]) next[pf][m] = [];
     }
 
+    for (const label of PLATFORM_METRICS[platform]) {
+      if (!(label in incoming)) continue;
+      const cleaned = clean(incoming[label], label);
+      next[platform][label] = cleaned;
+      // Mirror Instagram into the legacy field so a rollback still works.
+      if (platform === DEFAULT_PLATFORM && doc.serviceSlots) {
+        doc.serviceSlots[label] = cleaned;
+      }
+    }
+
+    doc.platformSlots = next;
+    doc.markModified('platformSlots');
+    doc.migratedToPlatforms = true;
     doc.migratedToSlots = true;
     doc.updatedAt = new Date();
     await doc.save();
-    log('⚙️  Service slots updated');
+    log(`⚙️  Service slots updated (${platform})`);
     res.json({ success: true, ...(await adminPanelConfig(doc)) });
   } catch (e) {
+    if (/Unknown panel/.test(e?.message || '')) {
+      return res.status(400).json({ error: e.message });
+    }
     err('POST /api/admin/service-slots:', e?.message || e);
     res.status(500).json({ error: e?.message || 'Could not save service slots' });
   }
