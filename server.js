@@ -299,7 +299,13 @@ DepositSchema.index({ status: 1, createdAt: -1 });
 const PaymentSettingsSchema = new mongoose.Schema({
   key:              { type: String, required: true, unique: true, default: 'default' },
   minDepositPaise:  { type: Number, default: 5000 },   // ₹50
+  /* Global commission, used for any platform without its own value. Kept as
+     the fallback so an existing install keeps pricing exactly as before. */
   markupPercent:    { type: Number, default: 30 },
+  /* Per-platform commission overrides: { instagram: 200, youtube: 150 }.
+     A platform missing from this map (or set to null) uses markupPercent.
+     Mixed type so adding a platform later needs no migration. */
+  platformMarkup:   { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
   upiEnabled:       { type: Boolean, default: true },
   cryptoEnabled:    { type: Boolean, default: false },
   /* ---- New Order paywall (admin switch) ----
@@ -635,6 +641,21 @@ function normalizePlatform(value) {
 /** Is this metric meaningful on this platform? */
 function metricAllowed(platform, metric) {
   return (PLATFORM_METRICS[normalizePlatform(platform)] || []).includes(String(metric).toLowerCase());
+}
+
+/** Commission % for one platform: its own override, else the global value.
+    A blank/invalid override deliberately falls back rather than becoming 0,
+    so a mistyped field can never silently sell at cost. */
+function markupFor(settings, platform) {
+  const p = normalizePlatform(platform);
+  const per = settings?.platformMarkup;
+  const raw = per && typeof per === 'object' ? per[p] : undefined;
+  const own = Number(raw);
+  if (raw !== null && raw !== undefined && raw !== '' && Number.isFinite(own) && own >= 0) {
+    return own;
+  }
+  const global = Number(settings?.markupPercent);
+  return Number.isFinite(global) && global >= 0 ? global : 0;
 }
 
 function emptyPlatformSlots() {
@@ -2711,7 +2732,10 @@ async function computeQuote(requestedUnits, platformArg = DEFAULT_PLATFORM) {
   const cfg = await getPanelConfig();
   const panelsById = await loadPanelsById();
   const settings = await getPaymentSettings();
-  const markup = 1 + (Number(settings.markupPercent) || 0) / 100;
+  /* Commission is per-platform, so a YouTube order can carry a different
+     margin from an Instagram one. */
+  const markupPercentUsed = markupFor(settings, platform);
+  const markup = 1 + markupPercentUsed / 100;
 
   const catalogueCache = new Map();
   const currencyCache = new Map();
@@ -2846,7 +2870,8 @@ async function computeQuote(requestedUnits, platformArg = DEFAULT_PLATFORM) {
   }
 
   const totalPaise = Object.values(breakdown).reduce((sum, v) => sum + v, 0);
-  const markupPercent = Number(settings.markupPercent) || 0;
+  // The rate actually applied to THIS order, so the owner view stays honest.
+  const markupPercent = markupPercentUsed;
   // What the panel charges us, before markup. Used to show your commission.
   const costPaise = Math.round((costInr || 0) * 100);
   return {
@@ -3603,6 +3628,20 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
     res.json({
       minDeposit: toRupees(doc.minDepositPaise),
       markupPercent: doc.markupPercent,
+      /* Effective commission per platform, already resolved: a platform with
+         no override reports the global number, so the UI can show what will
+         really be charged without repeating the fallback logic. */
+      platformMarkup: Object.fromEntries(
+        PLATFORMS.map(p => [p, markupFor(doc, p)])
+      ),
+      /* Which platforms have an explicit override, so the UI can show
+         "using global" instead of a number the admin never typed. */
+      platformMarkupSet: Object.fromEntries(
+        PLATFORMS.map(p => {
+          const raw = doc.platformMarkup?.[p];
+          return [p, raw !== null && raw !== undefined && raw !== '' && Number.isFinite(Number(raw))];
+        })
+      ),
       upiEnabled: doc.upiEnabled,
       cryptoEnabled: doc.cryptoEnabled,
       upiMethods: doc.upiMethods || [],
@@ -3660,6 +3699,31 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
         return res.status(400).json({ error: 'Markup must be between 0 and 1000%' });
       }
       doc.markupPercent = pct;
+    }
+
+    /* ---- Per-platform commission ----
+       Send null (or '') for a platform to clear its override and go back to
+       the global rate. Unknown keys are ignored rather than stored. */
+    if (body.platformMarkup && typeof body.platformMarkup === 'object') {
+      const next = { ...(doc.platformMarkup || {}) };
+      for (const key of Object.keys(body.platformMarkup)) {
+        const platform = String(key).toLowerCase();
+        if (!PLATFORMS.includes(platform)) continue;
+        const raw = body.platformMarkup[key];
+        if (raw === null || raw === undefined || raw === '') {
+          delete next[platform];
+          continue;
+        }
+        const pct = Number(raw);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 1000) {
+          return res.status(400).json({
+            error: `${PLATFORM_LABELS[platform]} commission must be between 0 and 1000%`,
+          });
+        }
+        next[platform] = pct;
+      }
+      doc.platformMarkup = next;
+      doc.markModified('platformMarkup');
     }
     if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
