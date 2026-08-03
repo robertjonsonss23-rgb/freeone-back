@@ -306,6 +306,11 @@ const PaymentSettingsSchema = new mongoose.Schema({
      A platform missing from this map (or set to null) uses markupPercent.
      Mixed type so adding a platform later needs no migration. */
   platformMarkup:   { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+  /* Commission for FOLLOWER growth, which is priced very differently from
+     post engagement — followers cost far more per unit, so a markup that
+     works for views can be wrong here. Per-platform, same shape and same
+     fallback rules as platformMarkup. Empty = use the platform rate. */
+  followerMarkup:   { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
   upiEnabled:       { type: Boolean, default: true },
   cryptoEnabled:    { type: Boolean, default: false },
   /* ---- New Order paywall (admin switch) ----
@@ -673,16 +678,29 @@ function metricAllowed(platform, metric) {
 /** Commission % for one platform: its own override, else the global value.
     A blank/invalid override deliberately falls back rather than becoming 0,
     so a mistyped field can never silently sell at cost. */
-function markupFor(settings, platform) {
+function readPercent(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Commission % to apply.
+ *
+ * `kind` is 'followers' for profile-growth orders and 'engagement' for
+ * everything else. Resolution order, most specific first:
+ *   followerMarkup[platform] -> platformMarkup[platform] -> markupPercent
+ * so an unset field always inherits rather than silently becoming 0.
+ */
+function markupFor(settings, platform, kind = 'engagement') {
   const p = normalizePlatform(platform);
-  const per = settings?.platformMarkup;
-  const raw = per && typeof per === 'object' ? per[p] : undefined;
-  const own = Number(raw);
-  if (raw !== null && raw !== undefined && raw !== '' && Number.isFinite(own) && own >= 0) {
-    return own;
+  if (kind === 'followers') {
+    const own = readPercent(settings?.followerMarkup?.[p]);
+    if (own !== null) return own;
   }
-  const global = Number(settings?.markupPercent);
-  return Number.isFinite(global) && global >= 0 ? global : 0;
+  const perPlatform = readPercent(settings?.platformMarkup?.[p]);
+  if (perPlatform !== null) return perPlatform;
+  return readPercent(settings?.markupPercent) ?? 0;
 }
 
 function emptyPlatformSlots() {
@@ -2559,6 +2577,7 @@ function invalidatePanelCatalogue(panelId) {
 
 async function fetchPanelCatalogue(panel) {
   const rates = new Map();
+  const mins = new Map();
   let ok = false;
   try {
     const params = new URLSearchParams({ key: panel.apiKey, action: 'services' });
@@ -2577,6 +2596,11 @@ async function fetchPanelCatalogue(panel) {
       const rate = Number(String(row?.rate ?? row?.price ?? row?.cost ?? '')
         .replace(/[^\d.]/g, ''));
       if (id && Number.isFinite(rate)) rates.set(id, rate);
+      /* The provider's own minimum order size. Follower services commonly
+         sit at 100, and every drip batch is a SEPARATE order, so a batch
+         below this is rejected by the panel. Read it rather than guess. */
+      const min = Number(String(row?.min ?? row?.minimum ?? '').replace(/[^\d.]/g, ''));
+      if (id && Number.isFinite(min) && min > 0) mins.set(id, Math.ceil(min));
     }
     ok = rates.size > 0;
   } catch (e) {
@@ -2594,7 +2618,7 @@ async function fetchPanelCatalogue(panel) {
     currency = extractPanelCurrency(balanceRes.data) || 'INR';
   } catch { /* default to INR */ }
 
-  return { rates, currency, ok };
+  return { rates, mins, currency, ok };
 }
 
 /* ============================================================
@@ -2756,7 +2780,12 @@ async function getPanelCatalogue(panel) {
         cached.fetchedAt = Date.now() - PANEL_CATALOGUE_TTL_MS + PANEL_STALE_RETRY_MS;
         return cached;
       }
-      const entry = { rates: fresh.rates, currency: fresh.currency, fetchedAt: Date.now() };
+      const entry = {
+        rates: fresh.rates,
+        mins: fresh.mins || new Map(),
+        currency: fresh.currency,
+        fetchedAt: Date.now(),
+      };
       panelCatalogueCache.set(id, entry);
       return entry;
     } finally {
@@ -2775,8 +2804,13 @@ async function computeQuote(requestedUnits, platformArg = DEFAULT_PLATFORM) {
   const settings = await getPaymentSettings();
   /* Commission is per-platform, so a YouTube order can carry a different
      margin from an Instagram one. */
-  const markupPercentUsed = markupFor(settings, platform);
-  const markup = 1 + markupPercentUsed / 100;
+  /* Markup is resolved PER METRIC, not once per order: followers carry
+     their own commission, so an order mixing followers with engagement
+     must price each part at its own rate. */
+  const markupPctFor = label => markupFor(
+    settings, platform, PROFILE_METRICS.includes(label) ? 'followers' : 'engagement'
+  );
+  const appliedMarkups = new Set();
 
   const catalogueCache = new Map();
   const currencyCache = new Map();
@@ -2895,7 +2929,9 @@ async function computeQuote(requestedUnits, platformArg = DEFAULT_PLATFORM) {
     }
 
     if (pricedAny) {
-      const withMarkup = labelTotal * markup;
+      const labelPct = markupPctFor(label);
+      appliedMarkups.add(labelPct);
+      const withMarkup = labelTotal * (1 + labelPct / 100);
       breakdown[label] = Math.round(withMarkup * 100);   // paise
       costInr += labelTotal;
     }
@@ -2912,7 +2948,12 @@ async function computeQuote(requestedUnits, platformArg = DEFAULT_PLATFORM) {
 
   const totalPaise = Object.values(breakdown).reduce((sum, v) => sum + v, 0);
   // The rate actually applied to THIS order, so the owner view stays honest.
-  const markupPercent = markupPercentUsed;
+  /* One number for the owner readout. Orders are single-purpose in
+     practice, so this is normally the only rate used; if an order ever
+     mixes rates, report the highest rather than a misleading average. */
+  const markupPercent = appliedMarkups.size
+    ? Math.max(...appliedMarkups)
+    : markupFor(settings, platform);
   // What the panel charges us, before markup. Used to show your commission.
   const costPaise = Math.round((costInr || 0) * 100);
   return {
@@ -2997,6 +3038,46 @@ app.get('/api/payment-methods', async (_req, res) => {
   } catch (e) {
     err('GET /api/payment-methods:', e?.message || e);
     res.status(500).json({ error: 'Could not load payment methods' });
+  }
+});
+
+/** The largest per-batch minimum across a platform's slots for one metric.
+    Largest, not smallest: the scheduler rotates batches across every slot,
+    so a batch has to satisfy whichever provider it lands on. */
+async function metricMinimum(cfg, panelsById, platform, label) {
+  const slots = usableSlots(cfg, label, panelsById, platform);
+  let min = 0;
+  for (const slot of slots) {
+    const panel = panelsById.get(slot.panelId);
+    if (!panel) continue;
+    try {
+      const cat = await getPanelCatalogue(panel);
+      const m = cat?.mins?.get(slot.serviceId);
+      if (Number.isFinite(m) && m > min) min = m;
+    } catch { /* a panel that will not answer must not block the page */ }
+  }
+  return min;
+}
+
+/** Public: minimum order size per platform for the followers service. */
+app.get('/api/followers/limits', async (_req, res) => {
+  try {
+    const cfg = await getPanelConfig();
+    const panelsById = await loadPanelsById();
+    const out = {};
+    for (const key of FOLLOWER_PLATFORMS) {
+      const configured = usableSlots(cfg, 'followers', panelsById, key).length > 0;
+      out[key] = {
+        configured,
+        /* Falls back to 1 when the panel does not publish a minimum, so a
+           silent provider never blocks ordering. */
+        minPerBatch: configured ? (await metricMinimum(cfg, panelsById, key, 'followers')) || 1 : 0,
+      };
+    }
+    res.json({ platforms: out });
+  } catch (e) {
+    err('GET /api/followers/limits:', e?.message || e);
+    res.status(500).json({ error: 'Could not load follower limits' });
   }
 });
 
@@ -3688,6 +3769,16 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
           return [p, raw !== null && raw !== undefined && raw !== '' && Number.isFinite(Number(raw))];
         })
       ),
+      /* Follower-growth commission, resolved the same way: a platform with
+         no follower override reports whatever followers would actually be
+         charged at (its platform rate, or the global one). */
+      followerMarkup: Object.fromEntries(
+        FOLLOWER_PLATFORMS.map(p => [p, markupFor(doc, p, 'followers')])
+      ),
+      followerMarkupSet: Object.fromEntries(
+        FOLLOWER_PLATFORMS.map(p => [p, readPercent(doc.followerMarkup?.[p]) !== null])
+      ),
+      followerPlatforms: FOLLOWER_PLATFORMS,
       upiEnabled: doc.upiEnabled,
       cryptoEnabled: doc.cryptoEnabled,
       upiMethods: doc.upiMethods || [],
@@ -3770,6 +3861,31 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
       }
       doc.platformMarkup = next;
       doc.markModified('platformMarkup');
+    }
+
+    /* ---- Follower-growth commission ----
+       Same contract as platformMarkup: null clears the override so
+       followers fall back to the platform (then global) rate. */
+    if (body.followerMarkup && typeof body.followerMarkup === 'object') {
+      const next = { ...(doc.followerMarkup || {}) };
+      for (const key of Object.keys(body.followerMarkup)) {
+        const platform = String(key).toLowerCase();
+        if (!FOLLOWER_PLATFORMS.includes(platform)) continue;
+        const raw = body.followerMarkup[key];
+        if (raw === null || raw === undefined || raw === '') {
+          delete next[platform];
+          continue;
+        }
+        const pct = Number(raw);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 1000) {
+          return res.status(400).json({
+            error: `${PLATFORM_LABELS[platform]} follower commission must be between 0 and 1000%`,
+          });
+        }
+        next[platform] = pct;
+      }
+      doc.followerMarkup = next;
+      doc.markModified('followerMarkup');
     }
     if (typeof body.upiEnabled === 'boolean') doc.upiEnabled = body.upiEnabled;
     if (typeof body.cryptoEnabled === 'boolean') doc.cryptoEnabled = body.cryptoEnabled;
