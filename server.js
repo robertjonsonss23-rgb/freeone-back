@@ -618,10 +618,37 @@ const PLATFORMS = ['instagram', 'tiktok', 'youtube'];
 const DEFAULT_PLATFORM = 'instagram';
 
 const PLATFORM_METRICS = {
-  instagram: ['views', 'likes', 'shares', 'saves', 'comments', 'reposts'],
+  /* `followers` targets a PROFILE, not a post, so it never appears on the
+     New Order page — it is sold through the dedicated Grow Followers page.
+     It still lives here so it is mapped, priced and rotated like any other
+     service with no special-casing anywhere else. */
+  instagram: ['views', 'likes', 'shares', 'saves', 'comments', 'reposts', 'followers'],
   tiktok:    ['views', 'likes', 'shares', 'saves', 'comments', 'followers'],
   youtube:   ['views', 'likes', 'comments', 'subscribers'],
 };
+
+/* Metrics that buy profile growth rather than engagement on one post. */
+const PROFILE_METRICS = ['followers', 'subscribers'];
+
+/** Platforms the Grow Followers page can sell. */
+const FOLLOWER_PLATFORMS = PLATFORMS.filter(p => PLATFORM_METRICS[p].includes('followers'));
+
+/* A followers order must point at a PROFILE. Sending a post/reel/video URL to
+   a followers service burns the customer's money for nothing, and the panel
+   usually reports success anyway — so it is refused up front rather than
+   discovered later. Deliberately permissive: anything that is not obviously
+   a post is allowed, because URL shapes vary and a false refusal is worse
+   than a rare miss. */
+const POST_URL_PATTERNS = [
+  /\/(p|reel|reels|tv|stories)\//i,   // instagram.com/p/... , /reel/...
+  /\/video\//i,                       // tiktok.com/@user/video/...
+  /\/(watch|shorts)\b/i,              // youtube.com/watch?v= , /shorts/
+  /[?&]v=/i,
+];
+
+function looksLikePostUrl(link) {
+  return POST_URL_PATTERNS.some(re => re.test(String(link || '')));
+}
 
 const PLATFORM_LABELS = {
   instagram: 'Instagram',
@@ -1261,6 +1288,9 @@ async function publicPanelConfig(doc, { includeProviders = false } = {}) {
       services,
       // A platform is usable once its Views mapping exists.
       configured: services.views?.enabled === true,
+      /* Separate gate for the Grow Followers page: it needs a followers
+         service, which has nothing to do with the views mapping. */
+      followersConfigured: services.followers?.enabled === true,
     };
   }
 
@@ -1870,6 +1900,17 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     const platform = normalizePlatform(req.body?.platform);
+
+    /* Profile-growth services need a profile URL. Checked before any money
+       moves, so a mistyped link costs the customer nothing. */
+    const wantsProfileMetric = Object.keys(services || {})
+      .some(k => PROFILE_METRICS.includes(String(k).toLowerCase()));
+    if (wantsProfileMetric && looksLikePostUrl(link)) {
+      return res.status(400).json({
+        error: 'Followers are delivered to a profile, not a single post. '
+             + 'Use your profile link (for example instagram.com/yourname).',
+      });
+    }
 
     /* Credentials come from the admin-managed config, NEVER from the client.
        Service ids are likewise resolved server-side, so a user cannot order
@@ -2970,8 +3011,13 @@ app.get('/api/platforms', async (_req, res) => {
         label: PLATFORM_LABELS[key],
         metrics: PLATFORM_METRICS[key],
         configured: usableSlots(doc, 'views', panelsById, key).length > 0,
+        /* Independent of `configured`: selling followers needs a followers
+           service, not a views one, so the Grow Followers page can be live
+           for a platform whose post campaigns are not. */
+        followersConfigured: usableSlots(doc, 'followers', panelsById, key).length > 0,
       })),
       defaultPlatform: DEFAULT_PLATFORM,
+      followerPlatforms: FOLLOWER_PLATFORMS,
     });
   } catch (e) {
     err('GET /api/platforms:', e?.message || e);
