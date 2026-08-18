@@ -342,6 +342,10 @@ const PaymentSettingsSchema = new mongoose.Schema({
      scheduler keeps retrying and the true state is kept in the database.
      Owner accounts always see the real thing. */
   hideRunProblems:        { type: Boolean, default: false },
+  /* Show the bot score to ordinary customers too. Off by default so the
+     behaviour is unchanged until the admin opts in — owners always see it
+     regardless of this flag. */
+  botScoreForUsers:       { type: Boolean, default: false },
   // A pending run older than this reads as 'completed' to normal users.
   pendingGraceMinutes:    { type: Number, default: 15 },
 
@@ -833,6 +837,8 @@ function sanitizeQrImage(value, previous = '') {
 function publicPaymentSettings(doc) {
   return {
     minDeposit: toRupees(doc.minDepositPaise),
+    /* Drives whether the New Order page shows the bot score to this user. */
+    botScoreForUsers: doc.botScoreForUsers === true,
     upiEnabled: Boolean(doc.upiEnabled),
     cryptoEnabled: Boolean(doc.cryptoEnabled),
     upiMethods: (doc.upiMethods || [])
@@ -3800,6 +3806,7 @@ app.get('/api/admin/payment-settings', requireAdmin, async (_req, res) => {
       })),
       lowBalanceThreshold: Number(doc.lowBalanceThreshold) || 0,
       hideRunProblems: Boolean(doc.hideRunProblems),
+      botScoreForUsers: Boolean(doc.botScoreForUsers),
       pendingGraceMinutes: Number(doc.pendingGraceMinutes) || 15,
       referralEnabled: Boolean(doc.referralEnabled),
       referrerReward: toRupees(doc.referrerRewardPaise),
@@ -3923,6 +3930,7 @@ app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
 
     /* ---- Orders display mask ---- */
     if (typeof body.hideRunProblems === 'boolean') doc.hideRunProblems = body.hideRunProblems;
+    if (typeof body.botScoreForUsers === 'boolean') doc.botScoreForUsers = body.botScoreForUsers;
     if (body.pendingGraceMinutes !== undefined) {
       const mins = Number(body.pendingGraceMinutes);
       if (!Number.isFinite(mins) || mins < 0 || mins > 1440) {
