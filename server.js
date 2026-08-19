@@ -200,6 +200,12 @@ const OrderSchema = new mongoose.Schema({
   // What the user paid, in paise. Used for pro-rata refunds on cancel.
   chargedPaise:     { type: Number, default: 0 },
   refundedPaise:    { type: Number, default: 0 },
+  /* What the SMM panel charges US for this order, in paise, captured at
+     the moment of purchase. Stored rather than recomputed because provider
+     rates change: re-pricing an old order later would quietly rewrite last
+     month's profit. Orders placed before this existed read as 0 and are
+     reported separately so the totals stay honest. */
+  panelCostPaise:   { type: Number, default: 0 },
   runStatuses:      [{ type: String }],
   createdAt:        { type: Date, default: Date.now },
   lastUpdatedAt:    { type: Date, default: Date.now },
@@ -2046,6 +2052,7 @@ app.post('/api/order', requireUser, requireOrderAccess, async (req, res) => {
       link,
       platform,
       chargedPaise: quote.totalPaise,
+      panelCostPaise: Number(quote.costPaise) || 0,
       status: 'pending',
       totalRuns: runs.length,
       completedRuns: 0,
@@ -4226,6 +4233,351 @@ app.post('/api/admin/service-slots', requireAdmin, async (req, res) => {
 // ---- Admin: list registered users ----
 /* ---- Admin: live balances of every connected panel ----
    `?refresh=1` bypasses the 5-minute cache. */
+/* ---- Admin: profit report ----
+   Revenue is what customers actually paid; cost is what the panels charge
+   us. Both come from figures recorded AT PURCHASE TIME, so re-running this
+   next month gives the same answer even if provider rates have moved.
+
+   Refunds are handled proportionally: cancelling half an order's runs
+   refunds half the money, so half the panel cost is deducted too —
+   otherwise a cancelled order would look like a loss.
+
+   `?days=N` limits the window; omit it for all time. */
+app.get('/api/admin/profit', requireAdmin, async (req, res) => {
+  try {
+    const days = Math.max(0, Math.min(3650, Number(req.query.days) || 0));
+    const since = days > 0 ? new Date(Date.now() - days * 86400_000) : null;
+    const match = since ? { createdAt: { $gte: since } } : {};
+
+    const orders = await Order.find(match, {
+      chargedPaise: 1, refundedPaise: 1, panelCostPaise: 1,
+      platform: 1, status: 1, createdAt: 1, userId: 1,
+    }).lean();
+
+    let revenue = 0, cost = 0, refunded = 0, unpriced = 0;
+    const byPlatform = {};
+    const byDay = new Map();
+
+    for (const o of orders) {
+      const charged = Number(o.chargedPaise) || 0;
+      const refund = Number(o.refundedPaise) || 0;
+      const fullCost = Number(o.panelCostPaise) || 0;
+
+      /* Net of refunds. The same fraction of the cost is written off,
+         because a refunded run is never sent to the provider. */
+      const kept = Math.max(0, charged - refund);
+      const costShare = charged > 0
+        ? Math.round(fullCost * (kept / charged))
+        : 0;
+
+      revenue += kept;
+      cost += costShare;
+      refunded += refund;
+      /* Orders placed before panelCostPaise existed. Counted separately so
+         the margin is not silently overstated. */
+      if (fullCost === 0 && kept > 0) unpriced += kept;
+
+      const pf = normalizePlatform(o.platform);
+      if (!byPlatform[pf]) byPlatform[pf] = { revenue: 0, cost: 0, orders: 0 };
+      byPlatform[pf].revenue += kept;
+      byPlatform[pf].cost += costShare;
+      byPlatform[pf].orders += 1;
+
+      const key = new Date(o.createdAt).toISOString().slice(0, 10);
+      const row = byDay.get(key) || { revenue: 0, cost: 0, orders: 0 };
+      row.revenue += kept; row.cost += costShare; row.orders += 1;
+      byDay.set(key, row);
+    }
+
+    /* Money actually taken from customers, which is a different question
+       from order revenue: deposits sit in wallets until they are spent. */
+    const depAgg = await Transaction.aggregate([
+      { $match: { type: 'deposit', ...(since ? { createdAt: { $gte: since } } : {}) } },
+      { $group: { _id: null, total: { $sum: '$amountPaise' } } },
+    ]);
+    const deposited = Number(depAgg?.[0]?.total) || 0;
+
+    /* Credit still sitting in customer wallets — a liability, not profit. */
+    const balAgg = await User.aggregate([
+      { $group: { _id: null, total: { $sum: '$balancePaise' } } },
+    ]);
+    const walletLiability = Number(balAgg?.[0]?.total) || 0;
+
+    const profit = revenue - cost;
+    res.json({
+      windowDays: days || null,
+      orders: orders.length,
+      revenue: toRupees(revenue),
+      cost: toRupees(cost),
+      profit: toRupees(profit),
+      margin: revenue > 0 ? +((profit / revenue) * 100).toFixed(1) : 0,
+      refunded: toRupees(refunded),
+      /* Revenue from orders with no recorded cost. Their margin is unknown,
+         so profit above is understated by whatever they really cost. */
+      unpricedRevenue: toRupees(unpriced),
+      deposited: toRupees(deposited),
+      walletLiability: toRupees(walletLiability),
+      byPlatform: Object.fromEntries(
+        Object.entries(byPlatform).map(([k, v]) => [k, {
+          revenue: toRupees(v.revenue),
+          cost: toRupees(v.cost),
+          profit: toRupees(v.revenue - v.cost),
+          orders: v.orders,
+        }])
+      ),
+      daily: [...byDay.entries()]
+        .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+        .slice(-60)
+        .map(([date, v]) => ({
+          date,
+          revenue: toRupees(v.revenue),
+          cost: toRupees(v.cost),
+          profit: toRupees(v.revenue - v.cost),
+          orders: v.orders,
+        })),
+    });
+  } catch (e) {
+    err('GET /api/admin/profit:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not build profit report' });
+  }
+});
+
+/* ============================================================
+   FAILURE DIAGNOSIS
+
+   Providers return terse, inconsistent strings ("Not enough funds",
+   "incorrect service id", "neworder.link invalid"). On their own they tell
+   the admin nothing actionable. This maps the common shapes onto a cause
+   and the one thing that actually fixes it.
+
+   Ordered most specific first: "insufficient funds" must not be caught by
+   the generic "invalid" rule. Anything unmatched falls through to a
+   deliberately honest "unrecognised" bucket rather than a wrong guess.
+   ============================================================ */
+const FAILURE_RULES = [
+  {
+    key: 'panel_funds',
+    test: /(not enough|insufficient|no) (funds|balance)|balance is too low|low balance/i,
+    title: 'Your panel account is out of money',
+    cause: 'The provider rejected the order because your balance with them is too low.',
+    fix: 'Top up that panel, then use Retry. Set a low-balance alert on the Panels tab so this warns you first.',
+    severity: 'critical',
+    scope: 'panel',
+  },
+  {
+    key: 'bad_service_id',
+    test: /(incorrect|invalid|unknown|wrong|no such|not found).{0,20}service|service.{0,20}(not found|does not exist|invalid|incorrect)/i,
+    title: 'Wrong service ID',
+    cause: 'This service ID does not exist on that panel — usually a typo, or the provider retired the service.',
+    fix: 'Admin → Services → find this metric → Browse and pick the service again.',
+    severity: 'critical',
+    scope: 'service',
+  },
+  {
+    key: 'bad_link',
+    test: /(invalid|incorrect|wrong|bad).{0,20}(link|url)|link.{0,20}(invalid|incorrect|not valid)|page not found|post not found/i,
+    title: 'The provider rejected the link',
+    cause: 'The post or profile URL was not accepted — often a private account, a deleted post, or the wrong link type for this service.',
+    fix: 'Check the link opens publicly in a browser. Followers need a PROFILE link; views need a POST link.',
+    severity: 'warning',
+    scope: 'order',
+  },
+  {
+    key: 'quantity',
+    test: /(min|minimum|max|maximum).{0,20}(quantity|order|amount)|quantity.{0,20}(too|min|max|invalid)|out of range/i,
+    title: 'Quantity outside the provider limits',
+    cause: 'The batch size is below the service minimum or above its maximum.',
+    fix: 'Check the min/max on the service (Admin → Services → Browse) and re-order within that range.',
+    severity: 'warning',
+    scope: 'service',
+  },
+  {
+    key: 'auth',
+    test: /(invalid|incorrect|wrong|bad).{0,20}(api )?key|unauthor|forbidden|authentication|403/i,
+    title: 'The panel rejected your API key',
+    cause: 'The stored key is wrong, expired, or the provider disabled it.',
+    fix: 'Admin → Panels → edit that panel and paste a fresh API key from the provider dashboard.',
+    severity: 'critical',
+    scope: 'panel',
+  },
+  {
+    key: 'duplicate',
+    test: /duplicate|already (exists|ordered|in progress)|same order/i,
+    title: 'The provider saw this as a duplicate',
+    cause: 'They block repeat orders for the same link within a short window.',
+    fix: 'Usually harmless — space the runs further apart, or wait and retry.',
+    severity: 'warning',
+    scope: 'order',
+  },
+  {
+    key: 'unreachable',
+    test: /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|network|timeout|getaddrinfo/i,
+    title: "Couldn't reach the panel",
+    cause: 'The provider did not respond — their server was down, slow, or the API URL is wrong.',
+    fix: 'Check the API URL on the Panels tab. If it is right, the provider is down — retry later.',
+    severity: 'critical',
+    scope: 'panel',
+  },
+  {
+    key: 'rate_limit',
+    test: /rate.?limit|too many requests|429|slow down|try again later|busy/i,
+    title: 'The provider throttled you',
+    cause: 'Too many orders were sent too quickly.',
+    fix: 'Usually self-healing — the system retries automatically. Widen delivery windows if it keeps happening.',
+    severity: 'info',
+    scope: 'panel',
+  },
+  {
+    key: 'server_error',
+    test: /HTTP 5\d\d|internal server error|bad gateway|service unavailable/i,
+    title: 'The panel returned a server error',
+    cause: 'Something broke on the provider side, not yours.',
+    fix: 'Nothing to fix here. Retry the run; if it persists, contact the provider.',
+    severity: 'warning',
+    scope: 'panel',
+  },
+];
+
+/** Turn a raw provider error into a cause and a fix. */
+function diagnoseFailure(raw) {
+  const text = String(raw || '').trim();
+  if (!text) {
+    return {
+      key: 'unknown', title: 'Failed with no message',
+      cause: 'The provider gave no reason.',
+      fix: 'Retry the run. If it fails again, check the service ID and your panel balance.',
+      severity: 'warning', scope: 'order',
+    };
+  }
+  for (const rule of FAILURE_RULES) {
+    if (rule.test.test(text)) {
+      const { test, ...rest } = rule;
+      return rest;
+    }
+  }
+  /* No guessing: an unmatched message is reported verbatim so the admin can
+     read the provider's own words rather than a misleading translation. */
+  return {
+    key: 'unrecognised',
+    title: 'Unrecognised provider error',
+    cause: `The provider said: "${text.slice(0, 200)}"`,
+    fix: 'Search that message in your provider dashboard or ask their support. Check the service ID and panel balance first.',
+    severity: 'warning', scope: 'order',
+  };
+}
+
+/* ---- Admin: what is failing, why, and what to do about it ---- */
+app.get('/api/admin/failures', requireAdmin, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 7));
+    const since = new Date(Date.now() - days * 86400_000);
+
+    const failed = await Run.find(
+      { status: 'failed', $or: [{ executedAt: { $gte: since } }, { time: { $gte: since } }] },
+      { id: 1, label: 1, service: 1, error: 1, link: 1, platform: 1,
+        schedulerOrderId: 1, executedAt: 1, time: 1, attempts: 1, apiUrl: 1 }
+    ).sort({ executedAt: -1, time: -1 }).limit(2000).lean();
+
+    const panels = await Panel.find().lean();
+    const byUrl = new Map(panels.map(p => [String(p.apiUrl), p]));
+
+    /* Group by (cause + service), because that is the unit the admin fixes:
+       "service 1234 on Panel A keeps failing for X". One row per real
+       problem beats 400 identical rows. */
+    const groups = new Map();
+    for (const r of failed) {
+      const d = diagnoseFailure(r.error);
+      const panel = byUrl.get(String(r.apiUrl));
+      const key = `${d.key}|${r.service}|${panel?.name || r.apiUrl}`;
+      const g = groups.get(key) || {
+        key, diagnosis: d,
+        serviceId: String(r.service || ''),
+        panelName: panel?.name || 'Unknown panel',
+        panelId: panel ? String(panel._id) : '',
+        label: String(r.label || '').toLowerCase(),
+        platform: normalizePlatform(r.platform),
+        count: 0, orders: new Set(), sampleError: r.error || '',
+        firstSeen: null, lastSeen: null, runIds: [],
+      };
+      g.count += 1;
+      if (r.schedulerOrderId) g.orders.add(r.schedulerOrderId);
+      if (g.runIds.length < 20) g.runIds.push(r.id);
+      const when = r.executedAt || r.time;
+      if (when) {
+        const t = new Date(when);
+        if (!g.firstSeen || t < g.firstSeen) g.firstSeen = t;
+        if (!g.lastSeen || t > g.lastSeen) g.lastSeen = t;
+      }
+      groups.set(key, g);
+    }
+
+    const SEV = { critical: 0, warning: 1, info: 2 };
+    const issues = [...groups.values()]
+      .map(g => ({
+        key: g.key,
+        title: g.diagnosis.title,
+        cause: g.diagnosis.cause,
+        fix: g.diagnosis.fix,
+        severity: g.diagnosis.severity,
+        scope: g.diagnosis.scope,
+        serviceId: g.serviceId,
+        panelName: g.panelName,
+        panelId: g.panelId,
+        metric: g.label,
+        platform: g.platform,
+        failedRuns: g.count,
+        affectedOrders: g.orders.size,
+        sampleError: String(g.sampleError || '').slice(0, 300),
+        firstSeen: g.firstSeen,
+        lastSeen: g.lastSeen,
+        runIds: g.runIds,
+      }))
+      .sort((a, b) =>
+        (SEV[a.severity] - SEV[b.severity]) || (b.failedRuns - a.failedRuns));
+
+    /* Health context so a spike is readable as a proportion, not a count. */
+    const totalRecent = await Run.countDocuments({
+      $or: [{ executedAt: { $gte: since } }, { time: { $gte: since } }],
+    });
+    const stuck = await Run.countDocuments({
+      status: 'pending', time: { $lt: new Date(Date.now() - 30 * 60_000) },
+    });
+
+    res.json({
+      windowDays: days,
+      totalFailed: failed.length,
+      totalRuns: totalRecent,
+      failureRate: totalRecent > 0 ? +((failed.length / totalRecent) * 100).toFixed(1) : 0,
+      stuckRuns: stuck,
+      issues,
+    });
+  } catch (e) {
+    err('GET /api/admin/failures:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not build the failure report' });
+  }
+});
+
+/* ---- Admin: retry the runs behind one issue ---- */
+app.post('/api/admin/failures/retry', requireAdmin, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.runIds) ? req.body.runIds.slice(0, 500) : [];
+    if (ids.length === 0) return res.status(400).json({ error: 'No runs specified' });
+    /* Re-queue a minute out so the scheduler picks them up on its next pass
+       rather than all at once. attempts is reset so the retry budget starts
+       fresh — the admin has presumably fixed the underlying cause. */
+    const result = await Run.updateMany(
+      { id: { $in: ids }, status: 'failed' },
+      { $set: { status: 'pending', time: new Date(Date.now() + 60_000),
+                error: null, attempts: 0, processingStartedAt: null } }
+    );
+    log(`🔁 Admin re-queued ${result.modifiedCount} failed run(s)`);
+    res.json({ success: true, requeued: result.modifiedCount });
+  } catch (e) {
+    err('POST /api/admin/failures/retry:', e?.message || e);
+    res.status(500).json({ error: e?.message || 'Could not retry those runs' });
+  }
+});
+
 app.get('/api/admin/panel-balances', requireAdmin, async (req, res) => {
   try {
     const force = String(req.query?.refresh || '') === '1';
